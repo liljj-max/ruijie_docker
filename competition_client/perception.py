@@ -37,6 +37,12 @@ ARUCO_DICT = cv2.aruco.DICT_4X4_50
 MARKER_SIZE_M = 0.03
 VALID_ARUCO_IDS = set(range(45))
 
+# Only trust detections in the near frontal region of the base.  This drops far
+# items that would otherwise be mis-associated to the wrong shelf.
+NEAR_FWD_MIN, NEAR_FWD_MAX = 0.15, 1.40
+NEAR_LAT_MAX = 0.80
+NEAR_Z_MIN, NEAR_Z_MAX = 0.30, 1.50
+
 # Fixed shelf geometry (world frame).  This is public scene structure, NOT the
 # randomised product-to-slot assignment.
 SHELF_X = {"A": -1.735, "B": -0.850, "C": 0.035, "D": 0.920, "E": 1.805}
@@ -175,6 +181,7 @@ class PerceptionNode(Node):
         depth = self.bridge.imgmsg_to_cv2(self._depth_msg)
 
         arucos = self._detect_aruco(rgb, T_cw) if self.enable_aruco else []
+        arucos = [a for a in arucos if self._in_near_region(a["world"])]
         anchors = []
         for a in arucos:
             slot = aruco_id_to_slot(a["id"])
@@ -188,6 +195,8 @@ class PerceptionNode(Node):
                 continue
             p_cam = self.pixel_to_cam(d["x"], d["y"], depth_m)
             p_world = (T_cw @ np.array([p_cam[0], p_cam[1], p_cam[2], 1.0]))[:3]
+            if not self._in_near_region(p_world):
+                continue
             slot, aruco_id, source = self._associate(p_world, anchors)
             products.append({
                 "kind": d["kind"], "conf": float(d["conf"]),
@@ -205,6 +214,22 @@ class PerceptionNode(Node):
         }
         self.products_pub.publish(String(data=json.dumps(products)))
         self.aruco_pub.publish(String(data=json.dumps(arucos)))
+
+    def _in_near_region(self, p_world) -> bool:
+        """True if a world point is in the base's near frontal region."""
+        if self.base_pos is None or self.base_quat is None:
+            return True
+        yaw = Rotation.from_quat(
+            np.asarray(self.base_quat)[[1, 2, 3, 0]]).as_euler("xyz")[2]
+        dx = float(p_world[0]) - float(self.base_pos[0])
+        dy = float(p_world[1]) - float(self.base_pos[1])
+        c, s = math.cos(-yaw), math.sin(-yaw)
+        fwd = c * dx - s * dy
+        lat = s * dx + c * dy
+        z = float(p_world[2])
+        return (NEAR_FWD_MIN <= fwd <= NEAR_FWD_MAX
+                and abs(lat) <= NEAR_LAT_MAX
+                and NEAR_Z_MIN <= z <= NEAR_Z_MAX)
 
     @staticmethod
     def _associate(p_world, anchors, max_dist: float = 0.22):

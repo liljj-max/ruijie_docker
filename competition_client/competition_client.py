@@ -44,7 +44,9 @@ DELIVERY_YAW = -math.pi / 2.0
 APPROACH_DX = 0.068          # base sits this far east of the target column
 SHELF_X = {"A": -1.735, "B": -0.850, "C": 0.035, "D": 0.920, "E": 1.805}
 COLUMN_DX = {"C1": -0.220, "C2": 0.0, "C3": 0.220}
-SCAN_Y = 2.30                # observation lane in front of the shelves
+SCAN_Y = 2.45                # observation lane in front of the shelves
+SCAN_SLIDE = 0.11            # raise the head to shelf level while scanning
+SCAN_PITCHES = [-0.35, -0.65, -0.95]
 TABLE_APPROACH = [-1.88, -2.80]
 
 # manipulation params (from the reference baseline)
@@ -64,7 +66,6 @@ REACH_Z_MIN, REACH_Z_MAX = 0.40, 1.35
 GRASP_ROT = np.eye(3)
 
 # scan behaviour
-SCAN_PITCHES = [-0.30, -0.60, -0.90]
 SCAN_DWELL = 1.2
 SCAN_SETTLE = 0.8
 
@@ -149,12 +150,13 @@ class CompetitionClient(Node):
         except Exception:  # noqa: BLE001
             self.products = []
         self.inventory.update(self.products, self.aruco)
-        if self.debug and self.products and self._now() - self.last_dbg > 2.0:
+        if self.debug and self._now() - self.last_dbg > 2.0:
             self.last_dbg = self._now()
             sample = [(p["kind"], p.get("slot"), p.get("slot_source"),
                        [round(x, 2) for x in p["world"]], round(p["conf"], 2))
                       for p in self.products[:6]]
-            self.get_logger().info(f"[dbg] dets={sample}")
+            aids = [(a["id"], [round(x, 2) for x in a["world"]]) for a in self.aruco[:8]]
+            self.get_logger().info(f"[dbg] aruco={aids} dets={sample}")
 
     def _aruco_cb(self, msg):
         try:
@@ -197,6 +199,8 @@ class CompetitionClient(Node):
                 else:
                     ang = 0.0 if abs(yaw_err) < 0.10 else 1.0 * yaw_err
                     lin = self._approach_speed(dist) * max(0.0, math.cos(yaw_err))
+                    if not self._front_clear():
+                        lin = 0.0
                     a.set_base_velocity(lin, ang)
             return False
         yaw_err = wrap_to_pi(self.route_yaw - a.base_yaw)
@@ -271,7 +275,6 @@ class CompetitionClient(Node):
         cand = np.median(np.array(list(self.det_buf)), axis=0)
         self.deploy_world = cand + DEPLOY_OFFSET
         self.creep_stop_y = cand[1] + CREEP_STOP_DY
-        self.target_locked = True
         return True
 
     # ---- main tick ----
@@ -292,9 +295,7 @@ class CompetitionClient(Node):
         elif self.phase == SCAN:
             self._tick_scan()
         elif self.phase == NAV_SHELF:
-            if not self._front_clear():
-                a.stop_base()
-            elif self._follow_route():
+            if self._follow_route():
                 self.det_buf.clear()
                 self.target_locked = False
                 self._enter(DEPLOY)
@@ -304,10 +305,17 @@ class CompetitionClient(Node):
             a.set_slide(SLIDE_GRASP)
             a.set_gripper("right", GRIP_OPEN)
             if not self.target_locked and self._now() - self.state_t0 > DETECT_DWELL:
-                if self._lock_from_products() and a.arm_to("right", self.deploy_world, GRASP_ROT):
-                    self._enter(CREEP)
-                else:
-                    self.det_buf.clear()
+                if self._lock_from_products():
+                    if a.arm_to("right", self.deploy_world, GRASP_ROT):
+                        self.target_locked = True
+                        self.get_logger().info(
+                            f"locked {self.target_kind} world={np.round(self.deploy_world, 3)}")
+                        self._enter(CREEP)
+                    else:
+                        self.get_logger().warn(
+                            f"IK failed for {np.round(self.deploy_world, 3)}, retrying")
+                        self.det_buf.clear()
+                        self.state_t0 = self._now()
         elif self.phase == CREEP:
             ee = a.ee_world("right")
             if ee[1] < self.creep_stop_y:
@@ -377,12 +385,10 @@ class CompetitionClient(Node):
             if not self.scan_route_set:
                 self._set_route([[1.92, SCAN_Y], obs], GRASP_YAW)
                 self.scan_route_set = True
-            if not self._front_clear():
-                a.stop_base()
-            else:
-                self._follow_route()
+            self._follow_route()
             return
         a.stop_base()
+        a.set_slide(SCAN_SLIDE)
         pitch = SCAN_PITCHES[self.scan_pitch_idx]
         a.set_head(0.0, pitch)
         if self._now() - self.state_t0 > SCAN_DWELL:
