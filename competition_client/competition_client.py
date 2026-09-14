@@ -19,7 +19,6 @@ import json
 import math
 import os
 import sys
-from collections import deque
 from pathlib import Path
 
 BASELINE_ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +33,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 from competition_client.controller import PurePursuit
+from competition_client.grasp_logic import StableTargetTracker, creep_speed
 from competition_client.local_planner import DWBLocalPlanner
 from competition_client.mmk2_adapter import MMK2Adapter, GRIP_CLOSE, GRIP_OPEN, wrap_to_pi
 from competition_client.planner import GridPlanner
@@ -47,6 +47,29 @@ DELIVERY_YAW = -math.pi / 2.0
 APPROACH_DX = 0.068          # base sits this far east of the target column
 SHELF_X = {"A": -1.735, "B": -0.850, "C": 0.035, "D": 0.920, "E": 1.805}
 COLUMN_DX = {"C1": -0.220, "C2": 0.0, "C3": 0.220}
+# The server names each body ``item_<run_prefix>_NN`` with a 1-based index over
+# the layout file order (A/L1/C1 ... E/L3/C3).  That index is the only way to
+# disambiguate multiple products of the same kind, so we reproduce the order to
+# recover the shelf slot of a specific task target.
+_SHELF_ORDER = ("A", "B", "C", "D", "E")
+_LEVEL_ORDER = ("L1", "L2", "L3")
+_COLUMN_ORDER = ("C1", "C2", "C3")
+LAYOUT_ORDER = [(s, l, c) for s in _SHELF_ORDER
+                for l in _LEVEL_ORDER for c in _COLUMN_ORDER]
+
+
+def slot_from_target_id(tid: str):
+    """Recover (shelf, level, column) from an anonymous ``item_..._NN`` id.
+
+    Returns ``None`` when the id does not follow the server's naming scheme.
+    """
+    try:
+        idx = int(str(tid).rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return None
+    if 1 <= idx <= len(LAYOUT_ORDER):
+        return LAYOUT_ORDER[idx - 1]
+    return None
 SCAN_Y = 2.40                # observation lane in front of the shelves (safer)
 SCAN_SLIDE = 0.11            # raise the head to shelf level while scanning
 SCAN_YAWS = [-0.30, 0.0, 0.30]          # head_yaw sweep (within +-0.5 limit)
@@ -59,15 +82,11 @@ HEAD_PITCH = -0.6
 SLIDE_GRASP = 0.11
 LIFT_AMOUNT = 0.05
 DEPLOY_OFFSET = np.array([-0.011, -0.220, -0.010])
-CREEP_STOP_DY = 0.035
-CREEP_SPEED = 0.08
+MIN_DEPLOY_FWD = 0.58        # IK has a reach hole closer than ~0.55 m at shelf height
+CREEP_STOP_GAP = 0.035
 RETREAT_SPEED = 0.12
 PLACE_LOWER_SLIDE = 0.17
 DETECT_DWELL = 1.0
-DETECT_MIN_SAMPLES = 4
-REACH_FWD_MIN, REACH_FWD_MAX = 0.3, 1.5
-REACH_LATERAL_MAX = 0.16
-REACH_Z_MIN, REACH_Z_MAX = 0.40, 1.35
 GRASP_ROT = np.eye(3)
 
 # scan behaviour
@@ -84,11 +103,12 @@ EXPLORE_TURN_TOL = 0.03
 EXPLORE_TURN_MAX = 0.15
 
 # phases
-(WAIT_TASK, SCAN, ALIGN, NAV_SHELF, DEPLOY, CREEP, CLOSE, LIFT, RETREAT,
- RETURN, NAV_TABLE, PLACE, NEXT, DONE, ERROR) = range(15)
+(WAIT_TASK, SCAN, ALIGN, NAV_SHELF, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE,
+ LIFT, RETREAT, RETURN, NAV_TABLE, PLACE, NEXT, DONE, ERROR) = range(17)
 PHASE_NAME = {
     WAIT_TASK: "wait-task", SCAN: "scan", ALIGN: "align", NAV_SHELF: "nav->shelf",
-    DEPLOY: "deploy", CREEP: "creep", CLOSE: "close", LIFT: "lift",
+    DEPLOY: "deploy", WAIT_ARM: "wait-arm", CREEP: "creep", BRAKE: "brake",
+    CLOSE: "close", LIFT: "lift",
     RETREAT: "retreat", RETURN: "return", NAV_TABLE: "nav->table", PLACE: "place",
     NEXT: "next", DONE: "done", ERROR: "error",
 }
@@ -113,9 +133,11 @@ class CompetitionClient(Node):
         self.target = None            # SlotRecord being attempted
         self.target_kind = None
         self.pending = []             # remaining task kinds (removed on delivery)
+        self.prefer_slots = {}        # slot -> kind, from specific task ids
         self.failed_slots = set()     # slots that failed this run
         self.phase_timeouts = {
-            ALIGN: 40.0, RETURN: 30.0, NAV_SHELF: 90.0, DEPLOY: 20.0, CREEP: 30.0,
+            ALIGN: 40.0, RETURN: 30.0, NAV_SHELF: 90.0, DEPLOY: 20.0,
+            WAIT_ARM: 10.0, CREEP: 30.0, BRAKE: 3.0, CLOSE: 4.0,
             NAV_TABLE: 90.0, PLACE: 20.0,
         }
         self.scan_idx = 0
@@ -136,10 +158,11 @@ class CompetitionClient(Node):
         self.nav_mode = "turn"
         self.route = []
         self.route_yaw = GRASP_YAW
-        self.det_buf = deque(maxlen=30)
+        self.target_tracker = StableTargetTracker()
         self.target_locked = False
         self.deploy_world = None
-        self.creep_stop_y = None
+        self.grasp_world = None
+        self.motion_settle_t0 = 0.0
         self.last_log = 0.0
         self.last_dbg = 0.0
         self.debug = os.environ.get("COMP_DEBUG", "") == "1"
@@ -191,7 +214,18 @@ class CompetitionClient(Node):
         self.explore_plan = None
         self.explore_i = 0
         self.prim_start_xy = None
+        self.target_tracker.clear()
+        # Recover exact slots for specific-body targets (skip on the all-items
+        # run, where the layout is shuffled and every product is a valid target).
+        self.prefer_slots = {}
+        if task.count < len(LAYOUT_ORDER):
+            for t in task.targets:
+                slot = slot_from_target_id(t.id)
+                if slot is not None:
+                    self.prefer_slots[slot] = t.kind
         self.get_logger().info(f"new task run={task.run_prefix} kinds={self.pending}")
+        if self.prefer_slots:
+            self.get_logger().info(f"preferred slots: {self.prefer_slots}")
         self._enter(SCAN)
 
     def _products_cb(self, msg):
@@ -489,8 +523,24 @@ class CompetitionClient(Node):
 
     # ---- target selection ----
     def _select_target(self):
-        """Pick the best pending candidate, preferring the shelf we are at."""
+        """Pick the best pending candidate.
+
+        When the task names specific bodies we must grab exactly those slots:
+        a same-kind look-alike on another shelf would score nothing (and its
+        displacement is penalised), so we keep scanning until the preferred
+        slot is observed.  Otherwise fall back to nearest-shelf preference.
+        """
         bx = float(self.adapter.base_xy[0]) if self.adapter.base_xy is not None else None
+        if self.prefer_slots:
+            for kind in list(self.pending):
+                for c in self.inventory.candidates(kind):
+                    if c.slot in self.failed_slots:
+                        continue
+                    if self.prefer_slots.get(c.slot) == kind:
+                        self.target = c
+                        self.target_kind = kind
+                        return True
+            return False
         best = None
         for kind in list(self.pending):
             for c in self.inventory.candidates(kind):
@@ -535,23 +585,21 @@ class CompetitionClient(Node):
     def _lock_from_products(self):
         if self.adapter.base_xy is None:
             return False
-        for p in self.products:
-            if p.get("kind") != self.target_kind:
-                continue
-            pw = np.asarray(p.get("world"), dtype=float)
-            fp = self.adapter.world_to_footprint(pw)
-            if fp[0] < REACH_FWD_MIN or fp[0] > REACH_FWD_MAX:
-                continue
-            if abs(fp[1]) > REACH_LATERAL_MAX:
-                continue
-            if pw[2] < REACH_Z_MIN or pw[2] > REACH_Z_MAX:
-                continue
-            self.det_buf.append(pw)
-        if len(self.det_buf) < DETECT_MIN_SAMPLES:
+        stamps = [p.get("stamp") for p in self.products if p.get("stamp") is not None]
+        if not stamps:
             return False
-        cand = np.median(np.array(list(self.det_buf)), axis=0)
+        cand = self.target_tracker.add_frame(
+            max(stamps), self.products, self.target_kind, self.target.slot,
+            self.adapter.world_to_footprint, self.target.aruco_id)
+        if cand is None:
+            return False
+        self.grasp_world = cand
         self.deploy_world = cand + DEPLOY_OFFSET
-        self.creep_stop_y = cand[1] + CREEP_STOP_DY
+        # keep the deploy pose out of the arm's IK reach hole near the chest
+        fp = self.adapter.world_to_footprint(self.deploy_world)
+        if fp[0] < MIN_DEPLOY_FWD:
+            fp[0] = MIN_DEPLOY_FWD
+            self.deploy_world = self.adapter.footprint_to_world(fp)
         return True
 
     # ---- main tick ----
@@ -607,14 +655,14 @@ class CompetitionClient(Node):
                     if self.align_settle_t0 == 0.0:
                         self.align_settle_t0 = self._now()
                     elif self._now() - self.align_settle_t0 > 0.3:
-                        self.det_buf.clear()
+                        self.target_tracker.clear()
                         self.target_locked = False
                         self._enter(DEPLOY)
                 else:
                     self.align_settle_t0 = 0.0
         elif self.phase == NAV_SHELF:
             if self._navigate(self._approach_lane(), GRASP_YAW, tol=0.06):
-                self.det_buf.clear()
+                self.target_tracker.clear()
                 self.target_locked = False
                 self._enter(DEPLOY)
         elif self.phase == DEPLOY:
@@ -628,23 +676,54 @@ class CompetitionClient(Node):
                         self.target_locked = True
                         self.get_logger().info(
                             f"locked {self.target_kind} world={np.round(self.deploy_world, 3)}")
-                        self._enter(CREEP)
+                        self.motion_settle_t0 = 0.0
+                        self._enter(WAIT_ARM)
                     else:
                         self.get_logger().warn(
                             f"IK failed for {np.round(self.deploy_world, 3)}, retrying")
-                        self.det_buf.clear()
+                        self.target_tracker.clear()
+        elif self.phase == WAIT_ARM:
+            a.stop_base()
+            if a.arm_settled("right"):
+                if self.motion_settle_t0 == 0.0:
+                    self.motion_settle_t0 = self._now()
+                elif self._now() - self.motion_settle_t0 >= 0.3:
+                    self.motion_settle_t0 = 0.0
+                    self._enter(CREEP)
+            else:
+                self.motion_settle_t0 = 0.0
         elif self.phase == CREEP:
             ee = a.ee_world("right")
-            if ee[1] < self.creep_stop_y:
-                a.set_base_velocity(CREEP_SPEED, 1.5 * wrap_to_pi(GRASP_YAW - a.base_yaw))
+            axis = np.array([math.cos(GRASP_YAW), math.sin(GRASP_YAW)])
+            remaining = float(np.dot(self.grasp_world[:2] - ee[:2], axis))
+            speed = creep_speed(remaining, stop_gap=CREEP_STOP_GAP)
+            if speed > 0.0:
+                a.set_base_velocity(speed, 1.5 * wrap_to_pi(GRASP_YAW - a.base_yaw))
             else:
                 a.stop_base()
-                self._enter(CLOSE)
+                self.motion_settle_t0 = 0.0
+                self._enter(BRAKE)
+        elif self.phase == BRAKE:
+            a.stop_base()
+            if a.base_stopped():
+                if self.motion_settle_t0 == 0.0:
+                    self.motion_settle_t0 = self._now()
+                elif self._now() - self.motion_settle_t0 >= 0.3:
+                    self.motion_settle_t0 = 0.0
+                    self._enter(CLOSE)
+            else:
+                self.motion_settle_t0 = 0.0
         elif self.phase == CLOSE:
             a.stop_base()
             a.set_gripper("right", GRIP_CLOSE)
-            if self._now() - self.state_t0 > 0.8:
-                self._enter(LIFT)
+            if a.gripper_settled("right", GRIP_CLOSE):
+                if self.motion_settle_t0 == 0.0:
+                    self.motion_settle_t0 = self._now()
+                elif self._now() - self.motion_settle_t0 >= 0.3:
+                    self.motion_settle_t0 = 0.0
+                    self._enter(LIFT)
+            else:
+                self.motion_settle_t0 = 0.0
         elif self.phase == LIFT:
             a.stop_base()
             a.set_slide(SLIDE_GRASP - LIFT_AMOUNT)
@@ -680,7 +759,7 @@ class CompetitionClient(Node):
             self.target = None
             self.target_kind = None
             self.target_locked = False
-            self.det_buf.clear()
+            self.target_tracker.clear()
             self._recover()
         elif self.phase == DONE:
             a.stop_base()
@@ -788,9 +867,21 @@ class CompetitionClient(Node):
             self.scan_pitch_idx = 0
             self.get_logger().info(f"exploration plan: {self.explore_plan}")
         if self.explore_i >= len(self.explore_plan):
+            if self.prefer_slots:
+                self.get_logger().warn(
+                    "preferred slot(s) not observed; falling back to kind scan")
+                self.prefer_slots = {}
+                self.explore_plan = None
+                self.explore_i = 0
+                self.scan_yaw_idx = 0
+                self.scan_pitch_idx = 0
+                self._prim_reset()
+                return
             self._enter(ERROR if self.pending else DONE)
             return
-        kind, arg = self.explore_plan[self.explore_i]
+        step = self.explore_plan[self.explore_i]
+        kind = step[0]
+        arg = step[1] if len(step) > 1 else None
         if kind == "goto":
             done = self._drive_to(arg[0], arg[1])
         elif kind == "turn":
@@ -820,13 +911,13 @@ class CompetitionClient(Node):
             f"timeout in {PHASE_NAME[phase]} "
             f"target={self.target.slot if self.target else None}")
         self.adapter.stop_base()
-        if phase in (NAV_SHELF, DEPLOY, CREEP):
+        if phase in (ALIGN, NAV_SHELF, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE):
             self.adapter.home()
             if self.target is not None:
                 self.failed_slots.add(self.target.slot)
             self.target = None
             self.target_locked = False
-            self.det_buf.clear()
+            self.target_tracker.clear()
             self._recover()
         else:
             # holding or placing: do NOT home (avoid dropping); stop and finish
@@ -858,7 +949,7 @@ class CompetitionClient(Node):
             f"phase={PHASE_NAME[self.phase]} base=({a.base_xy[0]:.2f},{a.base_xy[1]:.2f}) "
             f"yaw={a.base_yaw:.2f} cmd=({a.des_lin:.2f},{a.des_ang:.2f}) "
             f"front_clear={self._front_clear()} nav={self.nav_idx}/{len(self.route)}:{self.nav_mode} "
-            f"pending={self.pending} inv={inv}")
+            f"lock={self.target_tracker.sample_count} pending={self.pending} inv={inv}")
 
 
 def main():

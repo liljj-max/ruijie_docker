@@ -173,6 +173,11 @@ class PerceptionNode(Node):
     def _rgb_cb(self, msg: Image):
         if self.K is None or self._depth_msg is None:
             return
+        frame_stamp = float(msg.header.stamp.sec) + msg.header.stamp.nanosec * 1e-9
+        depth_stamp = (float(self._depth_msg.header.stamp.sec)
+                       + self._depth_msg.header.stamp.nanosec * 1e-9)
+        if abs(frame_stamp - depth_stamp) > 0.05:
+            return
         T_cw = self.camera_world_tmat()
         if T_cw is None:
             return
@@ -201,6 +206,7 @@ class PerceptionNode(Node):
             products.append({
                 "kind": d["kind"], "conf": float(d["conf"]),
                 "world": [float(x) for x in p_world],
+                "stamp": frame_stamp,
                 "slot": ({"shelf": slot[0], "level": slot[1], "column": slot[2]}
                          if slot else None),
                 "aruco_id": aruco_id,
@@ -210,7 +216,7 @@ class PerceptionNode(Node):
         self.latest = {
             "products": products,
             "aruco": arucos,
-            "stamp": float(msg.header.stamp.sec) + msg.header.stamp.nanosec * 1e-9,
+            "stamp": frame_stamp,
         }
         self.products_pub.publish(String(data=json.dumps(products)))
         self.aruco_pub.publish(String(data=json.dumps(arucos)))

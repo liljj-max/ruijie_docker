@@ -29,6 +29,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
 from common.control import step_func
+from competition_client.grasp_logic import base_is_stopped, joints_are_settled
 from kinematics.mmk2_kdl import MMK2Kdl
 
 # JointState names (order documented by the server).
@@ -86,6 +87,8 @@ class MMK2Adapter(Node):
 
         self.base_xy: Optional[np.ndarray] = None
         self.base_yaw = 0.0
+        self.base_lin_meas = 0.0
+        self.base_ang_meas = 0.0
         self.jpos: dict = {}
         self.jvel: dict = {}
 
@@ -109,6 +112,8 @@ class MMK2Adapter(Node):
         q = msg.pose.pose.orientation
         self.base_xy = np.array([p.x, p.y])
         self.base_yaw = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
+        self.base_lin_meas = float(msg.twist.twist.linear.x)
+        self.base_ang_meas = float(msg.twist.twist.angular.z)
 
     def _js_cb(self, msg: JointState) -> None:
         self.jpos = {n: msg.position[i] for i, n in enumerate(msg.name)
@@ -131,6 +136,40 @@ class MMK2Adapter(Node):
             self.jpos.get(f"{prefix}_arm_joint{i + 1}", self.tc[base + i])
             for i in range(6)
         ])
+
+    def arm_vel(self, side: str) -> np.ndarray:
+        prefix = "left" if side == "left" else "right"
+        return np.array([
+            self.jvel.get(
+                f"{prefix}_arm_joint{i + 1}",
+                0.0 if f"{prefix}_arm_joint{i + 1}" in self.jpos else float("inf"))
+            for i in range(6)
+        ])
+
+    def arm_settled(self, side: str, pos_tol: float = 0.03,
+                    vel_tol: float = 0.05) -> bool:
+        base = 5 if side == "left" else 12
+        return joints_are_settled(
+            self.tc[base:base + 6], self.arm_meas(side), self.arm_vel(side),
+            position_tolerance=pos_tol, velocity_tolerance=vel_tol)
+
+    def gripper_meas(self, side: str) -> float:
+        name = f"{'left' if side == 'left' else 'right'}_arm_eef_gripper_joint"
+        base = 11 if side == "left" else 18
+        return float(self.jpos.get(name, self.action[base]))
+
+    def gripper_vel(self, side: str) -> float:
+        name = f"{'left' if side == 'left' else 'right'}_arm_eef_gripper_joint"
+        return float(self.jvel.get(name, 0.0 if name in self.jpos else float("inf")))
+
+    def gripper_settled(self, side: str, target: float,
+                        pos_tol: float = 0.05, vel_tol: float = 0.05) -> bool:
+        return joints_are_settled(
+            [target], [self.gripper_meas(side)], [self.gripper_vel(side)],
+            position_tolerance=pos_tol, velocity_tolerance=vel_tol)
+
+    def base_stopped(self) -> bool:
+        return base_is_stopped(self.base_lin_meas, self.base_ang_meas)
 
     @property
     def rarm_meas(self) -> np.ndarray:
