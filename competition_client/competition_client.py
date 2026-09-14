@@ -33,7 +33,9 @@ from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
+from competition_client.controller import PurePursuit
 from competition_client.mmk2_adapter import MMK2Adapter, GRIP_CLOSE, GRIP_OPEN, wrap_to_pi
+from competition_client.planner import GridPlanner
 from competition_client.shelf_scanner import ShelfInventory
 from competition_client.task_parser import TaskListener
 
@@ -119,6 +121,23 @@ class CompetitionClient(Node):
         self.last_dbg = 0.0
         self.debug = os.environ.get("COMP_DEBUG", "") == "1"
         self.dt = 1.0 / 30.0
+        # reactive avoidance / stuck recovery
+        self.avoid_dir = 1.0
+        self.avoid_until = 0.0
+        self.avoid_back_until = 0.0
+        self.stuck_pos = None
+        self.stuck_t0 = 0.0
+        self.stuck_yaw = 0.0
+        self.recover_until = 0.0
+        self.deploy_creep_until = 0.0
+        self.prev_yaw = None
+        self.prev_yaw_t = 0.0
+        # grid planner + path follower
+        self.planner = GridPlanner()
+        self.controller = PurePursuit()
+        self.path = None
+        self.path_goal = None
+        self.replan_t = 0.0
 
         self.create_subscription(String, "/competition/product_detections",
                                  self._products_cb, 10)
@@ -196,11 +215,11 @@ class CompetitionClient(Node):
                     self.nav_idx += 1
                     self.nav_mode = "turn"
                     a.stop_base()
+                elif not self._front_clear():
+                    self._avoid_step()
                 else:
                     ang = 0.0 if abs(yaw_err) < 0.10 else 1.0 * yaw_err
                     lin = self._approach_speed(dist) * max(0.0, math.cos(yaw_err))
-                    if not self._front_clear():
-                        lin = 0.0
                     a.set_base_velocity(lin, ang)
             return False
         yaw_err = wrap_to_pi(self.route_yaw - a.base_yaw)
@@ -219,6 +238,69 @@ class CompetitionClient(Node):
             return 0.12
         return 0.25
 
+    # ---- grid-planner navigation ----
+    def _navigate(self, goal, final_yaw=None, tol: float = 0.15) -> bool:
+        """Plan an A* path to ``goal`` and follow it.  Returns True when reached.
+
+        ``final_yaw`` = None means any final heading is acceptable.
+        """
+        a = self.adapter
+        now = self._now()
+        goal = (float(goal[0]), float(goal[1]))
+        if self.path_goal != goal:
+            self.path = None
+            self.path_goal = goal
+        if self.scan_ranges is not None:
+            self.planner.update_scan(
+                self.scan_ranges, self.scan_angle_min, self.scan_angle_inc,
+                float(a.base_xy[0]), float(a.base_xy[1]), float(a.base_yaw))
+        if self.path is None or now - self.replan_t > 1.5:
+            self.replan_t = now
+            self.path = self.planner.plan(
+                (float(a.base_xy[0]), float(a.base_xy[1])), goal)
+            if self.path is not None:
+                self.get_logger().info(
+                    f"planned {len(self.path)} pts -> {np.round(goal, 2)}")
+
+        # stuck recovery: back straight out for a moment, then replan
+        if now < self.recover_until:
+            a.set_base_velocity(-0.40, 0.0)
+            return False
+
+        if self.path is None:
+            a.stop_base()
+            return False
+        eff_goal = self.path[-1]
+        dist_goal = float(np.hypot(eff_goal[0] - a.base_xy[0],
+                                   eff_goal[1] - a.base_xy[1]))
+        if dist_goal < tol:
+            if final_yaw is None:
+                a.stop_base()
+                self.path = None
+                return True
+            yaw_err = wrap_to_pi(final_yaw - a.base_yaw)
+            if abs(yaw_err) < 0.10:
+                a.stop_base()
+                self.path = None
+                return True
+            a.set_base_velocity(0.0, 1.0 * yaw_err)
+            return False
+
+        now2 = self._now()
+        if self.prev_yaw is not None and now2 > self.prev_yaw_t:
+            yaw_rate = wrap_to_pi(a.base_yaw - self.prev_yaw) / (now2 - self.prev_yaw_t)
+            yaw_rate = max(-3.0, min(3.0, yaw_rate))
+        else:
+            yaw_rate = 0.0
+        self.prev_yaw = a.base_yaw
+        self.prev_yaw_t = now2
+        lin, ang, _ = self.controller.compute(
+            (float(a.base_xy[0]), float(a.base_xy[1])), a.base_yaw, self.path, yaw_rate)
+        if lin > 0.0 and self._path_blocked():
+            lin = 0.0
+        a.set_base_velocity(lin, ang)
+        return False
+
     def _front_clear(self):
         """Reactive safety: False if something is within 0.35 m ahead.
 
@@ -231,12 +313,104 @@ class CompetitionClient(Node):
         n = r.size
         ang = self.scan_angle_min + self.scan_angle_inc * np.arange(n)
         ang = (ang + math.pi) % (2.0 * math.pi) - math.pi
-        mask = np.abs(ang) <= math.radians(35.0)
+        mask = np.abs(ang) <= math.radians(50.0)
         front = r[mask]
         front = front[np.isfinite(front) & (front > 0.0)]
         if front.size == 0:
             return True
         return float(np.min(front)) > 0.55
+
+    def _path_ahead(self, base_xy, path, dmin: float, dmax: float, step: float = 0.05):
+        """Sample world points along ``path`` at arc distance [dmin, dmax]."""
+        pts = []
+        prev = np.asarray(base_xy, dtype=float)
+        base = prev
+        for p in path:
+            p = np.asarray(p, dtype=float)
+            seg = p - prev
+            seglen = float(np.linalg.norm(seg))
+            if seglen < 1e-6:
+                prev = p
+                continue
+            n = max(1, int(seglen / step))
+            for t in np.linspace(0.0, 1.0, n + 1):
+                q = prev + seg * t
+                d = float(np.linalg.norm(q - base))
+                if dmin <= d <= dmax:
+                    pts.append(q)
+            prev = p
+        return pts
+
+    def _path_blocked(self, half_width: float = 0.28) -> bool:
+        """True if a scan point lies inside the robot corridor along the next
+        stretch of the planned path (replaces the fixed front-sector stop).
+
+        Self returns inside the footprint box are ignored.
+        """
+        a = self.adapter
+        if (self.scan_ranges is None or self.path is None
+                or a.base_xy is None or self.scan_ranges.size == 0):
+            return False
+        pts = self._path_ahead(a.base_xy, self.path, 0.25, 0.70)
+        if not pts:
+            return False
+
+        r = self.scan_ranges
+        n = r.size
+        ang = self.scan_angle_min + self.scan_angle_inc * np.arange(n)
+        valid = np.isfinite(r) & (r > 0.05) & (r < 12.0)
+        ex_b = r * np.cos(ang) + 0.1137
+        ey_b = r * np.sin(ang)
+        inside = (np.abs(ex_b) <= 0.35) & (np.abs(ey_b) <= 0.35)
+        valid &= ~inside
+        if not np.any(valid):
+            return False
+
+        lx = a.base_xy[0] + math.cos(a.base_yaw) * 0.1137
+        ly = a.base_xy[1] + math.sin(a.base_yaw) * 0.1137
+        wang = a.base_yaw + ang
+        X = lx + r * np.cos(wang)
+        Y = ly + r * np.sin(wang)
+
+        for q in pts:
+            d = np.hypot(X - q[0], Y - q[1])
+            if np.any(d[valid] < half_width):
+                return True
+        return False
+
+    def _sector_min(self, a0, a1):
+        """Minimum valid range within an angular sector [a0, a1] (rad)."""
+        if self.scan_ranges is None or self.scan_ranges.size == 0:
+            return float("inf")
+        r = self.scan_ranges
+        n = r.size
+        ang = self.scan_angle_min + self.scan_angle_inc * np.arange(n)
+        ang = (ang + math.pi) % (2.0 * math.pi) - math.pi
+        mask = (ang >= a0) & (ang <= a1)
+        vals = r[mask]
+        vals = vals[np.isfinite(vals) & (vals > 0.0)]
+        return float(np.min(vals)) if vals.size else float("inf")
+
+    def _avoid_step(self):
+        """Reactive obstacle avoidance: pick a side and steer around, or back up."""
+        a = self.adapter
+        now = self._now()
+        if now < self.avoid_back_until:
+            a.set_base_velocity(-0.15, 0.0)
+            return
+        if now < self.avoid_until:
+            a.set_base_velocity(0.06, 1.0 * self.avoid_dir)
+            return
+        d_l = self._sector_min(math.radians(20.0), math.radians(85.0))
+        d_r = self._sector_min(math.radians(-85.0), math.radians(-20.0))
+        if max(d_l, d_r) < 0.30:
+            self.avoid_back_until = now + 1.2
+            self.avoid_dir = -self.avoid_dir
+            a.set_base_velocity(-0.15, 0.0)
+            return
+        self.avoid_dir = 1.0 if d_l >= d_r else -1.0
+        self.avoid_until = now + 1.4
+        a.set_base_velocity(0.06, 1.0 * self.avoid_dir)
 
     # ---- target selection ----
     def _select_target(self):
@@ -290,32 +464,54 @@ class CompetitionClient(Node):
             self._log()
             return
 
+        if self.phase in (SCAN, NAV_SHELF, NAV_TABLE) and a.base_xy is not None:
+            moved = (self.stuck_pos is None
+                     or float(np.linalg.norm(a.base_xy - self.stuck_pos)) > 0.05
+                     or abs(wrap_to_pi(a.base_yaw - self.stuck_yaw)) > 0.05)
+            if moved:
+                self.stuck_pos = a.base_xy.copy()
+                self.stuck_yaw = a.base_yaw
+                self.stuck_t0 = self._now()
+            elif self._now() - self.stuck_t0 > 6.0:
+                self.get_logger().warn("stuck detected; backing out + replan")
+                self.path = None
+                self.replan_t = 0.0
+                self.recover_until = self._now() + 3.0
+                self.stuck_t0 = self._now()
+                self.stuck_pos = a.base_xy.copy()
+                self.stuck_yaw = a.base_yaw
+
         if self.phase == WAIT_TASK:
             a.stop_base()
         elif self.phase == SCAN:
             self._tick_scan()
         elif self.phase == NAV_SHELF:
-            if self._follow_route():
+            if self._navigate(self._approach_lane(), GRASP_YAW, tol=0.06):
                 self.det_buf.clear()
                 self.target_locked = False
                 self._enter(DEPLOY)
         elif self.phase == DEPLOY:
-            a.stop_base()
             a.set_head(0.0, HEAD_PITCH)
             a.set_slide(SLIDE_GRASP)
             a.set_gripper("right", GRIP_OPEN)
-            if not self.target_locked and self._now() - self.state_t0 > DETECT_DWELL:
-                if self._lock_from_products():
-                    if a.arm_to("right", self.deploy_world, GRASP_ROT):
-                        self.target_locked = True
-                        self.get_logger().info(
-                            f"locked {self.target_kind} world={np.round(self.deploy_world, 3)}")
-                        self._enter(CREEP)
-                    else:
-                        self.get_logger().warn(
-                            f"IK failed for {np.round(self.deploy_world, 3)}, retrying")
-                        self.det_buf.clear()
-                        self.state_t0 = self._now()
+            if self._now() < self.deploy_creep_until:
+                # bring the target into arm reach with a short forward creep
+                yaw_err = wrap_to_pi(GRASP_YAW - a.base_yaw)
+                a.set_base_velocity(0.12, 1.0 * yaw_err)
+            else:
+                a.stop_base()
+                if not self.target_locked and self._now() - self.state_t0 > DETECT_DWELL:
+                    if self._lock_from_products():
+                        if a.arm_to("right", self.deploy_world, GRASP_ROT):
+                            self.target_locked = True
+                            self.get_logger().info(
+                                f"locked {self.target_kind} world={np.round(self.deploy_world, 3)}")
+                            self._enter(CREEP)
+                        else:
+                            self.get_logger().warn(
+                                f"IK failed for {np.round(self.deploy_world, 3)}, creeping closer")
+                            self.det_buf.clear()
+                            self.deploy_creep_until = self._now() + 2.0
         elif self.phase == CREEP:
             ee = a.ee_world("right")
             if ee[1] < self.creep_stop_y:
@@ -339,10 +535,9 @@ class CompetitionClient(Node):
                 a.set_base_velocity(-RETREAT_SPEED, 1.0 * yaw_err)
             else:
                 a.stop_base()
-                self._set_route([[a.base_xy[0], YELLOW_MID_Y], TABLE_APPROACH], DELIVERY_YAW)
                 self._enter(NAV_TABLE)
         elif self.phase == NAV_TABLE:
-            if self._follow_route():
+            if self._navigate(TABLE_APPROACH, DELIVERY_YAW):
                 self._enter(PLACE)
         elif self.phase == PLACE:
             a.stop_base()
@@ -381,11 +576,7 @@ class CompetitionClient(Node):
         if a.base_xy is None:
             a.stop_base()
             return
-        if np.linalg.norm(a.base_xy - np.asarray(obs)) > 0.10:
-            if not self.scan_route_set:
-                self._set_route([[1.92, SCAN_Y], obs], GRASP_YAW)
-                self.scan_route_set = True
-            self._follow_route()
+        if not self._navigate(obs, None):
             return
         a.stop_base()
         a.set_slide(SCAN_SLIDE)
@@ -401,7 +592,8 @@ class CompetitionClient(Node):
 
     def _start_nav_shelf(self):
         lane = self._approach_lane()
-        self._set_route([[1.92, YELLOW_MID_Y], lane], GRASP_YAW)
+        self.path = None
+        self.path_goal = None
         self.get_logger().info(
             f"target kind={self.target_kind} slot={self.target.slot} lane={lane}")
         self._enter(NAV_SHELF)

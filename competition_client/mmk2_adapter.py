@@ -48,16 +48,15 @@ INIT_ARM_R = [0.0, -0.166, 0.032, 0.0, -1.571, -2.223]
 GRIP_OPEN, GRIP_CLOSE = 1.0, 0.08
 SLIDE_MIN, SLIDE_MAX = -0.04, 0.87
 
-# Safety limits.  The official server's base responds to /cmd_vel at only ~1/8
-# of the commanded value, so a modest publish-time gain compensates.  Speeds are
-# kept low for safety; the navigation controller additionally decelerates near
-# waypoints.
-MAX_LIN, MAX_ANG = 0.25, 1.0
-MAX_LIN_ACC, MAX_ANG_ACC = 0.6, 3.0
+# Safety limits / achievable envelope.  The server's base responds to /cmd_vel
+# at roughly 1/8 of the commanded value (measured), so a publish-time gain maps
+# the physical command into the responsive range without saturating the wheel PID.
+MAX_LIN, MAX_ANG = 0.20, 0.60
+MAX_LIN_ACC, MAX_ANG_ACC = 0.5, 2.0
 JOINT_SLEW = 1.2  # rad/s for the fastest joint
 
-BASE_GAIN_LIN = 4.0
-BASE_GAIN_ANG = 2.0
+BASE_GAIN_LIN = 8.0
+BASE_GAIN_ANG = 5.0
 
 
 def wrap_to_pi(a: float) -> float:
