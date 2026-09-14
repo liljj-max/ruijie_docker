@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+*.downloading
+tools/yolov8s.pt
+*.log
