@@ -39,7 +39,7 @@ CORRIDOR_BOARD = (0.515, 0.545, -3.72, 1.70)    # x0, x1, y0, y1  (HIGH, 1.5 m)
 # used robot_radius 0.35 / footprint 0.38 with a soft inflation_radius 0.60-0.65
 # (paths allowed to pass closer, cost gradient pushes them away).  HIGH covers
 # the arm reach, LOW only the chassis (the stowed arms pass above low obstacles).
-INFLATE_HIGH = 0.40
+INFLATE_HIGH = 0.45
 INFLATE_LOW = 0.25
 
 # Laser mounted 0.1137 m ahead of base_link (from the static TF).

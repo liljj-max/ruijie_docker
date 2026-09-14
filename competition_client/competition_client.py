@@ -34,6 +34,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 from competition_client.controller import PurePursuit
+from competition_client.local_planner import DWBLocalPlanner
 from competition_client.mmk2_adapter import MMK2Adapter, GRIP_CLOSE, GRIP_OPEN, wrap_to_pi
 from competition_client.planner import GridPlanner
 from competition_client.shelf_scanner import ShelfInventory
@@ -137,6 +138,7 @@ class CompetitionClient(Node):
         # grid planner + path follower
         self.planner = GridPlanner()
         self.controller = PurePursuit()
+        self.dwb = DWBLocalPlanner()
         self.path = None
         self.path_goal = None
         self.replan_t = 0.0
@@ -255,6 +257,7 @@ class CompetitionClient(Node):
         if self.path_goal != goal:
             self.path = None
             self.path_goal = goal
+            self.dwb.reset()
         if self.scan_ranges is not None:
             self.planner.update_scan(
                 self.scan_ranges, self.scan_angle_min, self.scan_angle_inc,
@@ -276,8 +279,8 @@ class CompetitionClient(Node):
         # inflated obstacles (e.g. drifted into the shelf); back out and replan
         ci, cj = self.planner.world_to_idx(float(a.base_xy[0]), float(a.base_xy[1]))
         if (0 <= ci < self.planner.nx and 0 <= cj < self.planner.ny
-                and self.planner.blocked[ci, cj]):
-            self.get_logger().warn("base inside inflated obstacle; escaping")
+                and float(self.planner.margin[ci, cj]) < 0.05):
+            self.get_logger().warn("base inside safety buffer; escaping")
             self._command_escape(0.18)
             self.path = None
             self.replan_t = 0.0
@@ -316,11 +319,10 @@ class CompetitionClient(Node):
             a.set_base_velocity(0.0, ang)
             return False
 
-        lin, ang, _ = self.controller.compute(
-            (float(a.base_xy[0]), float(a.base_xy[1])), a.base_yaw, self.path, yaw_rate)
-        if lin > 0.0 and self._path_blocked():
-            lin = 0.0
-        a.set_base_velocity(lin, ang)
+        v, w, _ = self.dwb.compute(
+            self.planner, (float(a.base_xy[0]), float(a.base_xy[1])),
+            a.base_yaw, self.path, eff_goal)
+        a.set_base_velocity(v, w)
         return False
 
     def _front_clear(self):
