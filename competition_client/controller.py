@@ -26,9 +26,9 @@ def wrap_to_pi(a: float) -> float:
 
 
 class PurePursuit:
-    def __init__(self, lookahead: float = 0.35, max_lin: float = 0.20,
-                 max_ang: float = 0.60, goal_tol: float = 0.15,
-                 slow_radius: float = 0.60, pivot_ang: float = 0.60,
+    def __init__(self, lookahead: float = 0.50, max_lin: float = 0.18,
+                 max_ang: float = 0.30, goal_tol: float = 0.15,
+                 slow_radius: float = 0.80, pivot_ang: float = 0.60,
                  kp: float = 0.8, kd: float = 0.5):
         self.lookahead = lookahead
         self.max_lin = max_lin
@@ -71,6 +71,6 @@ class PurePursuit:
         else:
             v = self.max_lin
             if dist_goal < self.slow_radius:
-                v = min(v, max(0.05, 0.35 * dist_goal))
+                v = min(v, max(0.04, 0.25 * dist_goal))
             lin = v * max(0.0, math.cos(alpha))
         return lin, ang, dist_goal

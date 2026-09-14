@@ -35,9 +35,12 @@ SHELF_Y = 3.323
 DELIVERY_TABLE = (-2.42, -1.46, -3.63, -3.19)   # x0, x1, y0, y1  (LOW, 0.77 m)
 CORRIDOR_BOARD = (0.515, 0.545, -3.72, 1.70)    # x0, x1, y0, y1  (HIGH, 1.5 m)
 
-# Inflation radii (m): arm reach for tall structures, chassis for low ones.
-INFLATE_HIGH = 0.50
-INFLATE_LOW = 0.30
+# Inflation radii (m).  Mapped from the previous Nav2 setup: the global planner
+# used robot_radius 0.35 / footprint 0.38 with a soft inflation_radius 0.60-0.65
+# (paths allowed to pass closer, cost gradient pushes them away).  HIGH covers
+# the arm reach, LOW only the chassis (the stowed arms pass above low obstacles).
+INFLATE_HIGH = 0.40
+INFLATE_LOW = 0.25
 
 # Laser mounted 0.1137 m ahead of base_link (from the static TF).
 LASER_OFFSET = (0.1137, 0.0)
@@ -65,6 +68,7 @@ class GridPlanner:
         self.hits = np.zeros((self.nx, self.ny), dtype=np.int16)
         self.blocked = np.zeros((self.nx, self.ny), dtype=bool)
         self.margin = np.zeros((self.nx, self.ny), dtype=np.float32)
+        self.dist_all = np.zeros((self.nx, self.ny), dtype=np.float32)
         self.cost = np.ones((self.nx, self.ny), dtype=np.float32)
         self._build_static()
         self._recompute()
@@ -106,8 +110,18 @@ class GridPlanner:
         self.margin = np.minimum(d_high - INFLATE_HIGH,
                                  d_low - INFLATE_LOW).astype(np.float32)
         self.blocked = self.margin <= 0.0
+        occ_all = self.static_high | self.static_low | self.dynamic
+        self.dist_all = (ndimage.distance_transform_edt(~occ_all) * self.res).astype(np.float32)
         self.cost = 1.0 + COST_K * np.clip(
             1.0 - np.maximum(self.margin, 0.0) / PREFER_CLEAR, 0.0, 1.0)
+
+    def grad_at(self, i: int, j: int):
+        """Grid gradient of the obstacle-distance field (points away from obstacles)."""
+        ip, im = min(i + 1, self.nx - 1), max(i - 1, 0)
+        jp, jm = min(j + 1, self.ny - 1), max(j - 1, 0)
+        di = float(self.dist_all[ip, j] - self.dist_all[im, j])
+        dj = float(self.dist_all[i, jp] - self.dist_all[i, jm])
+        return di, dj
 
     # ---- dynamic layer from the 360 LaserScan ----
     def update_scan(self, ranges, angle_min: float, angle_inc: float,
