@@ -52,7 +52,7 @@ MIN_RANGE = 0.25
 MAX_RANGE = 12.0
 PERSIST = 3            # frames an obstacle survives without re-observation
 PREFER_CLEAR = 0.60    # prefer this much margin beyond the inflation radii
-COST_K = 4.0
+COST_K = 8.0           # weight of the proximity cost (higher = keep to the middle)
 
 
 class GridPlanner:
@@ -232,7 +232,47 @@ class GridPlanner:
             path_idx.append(cur)
         path_idx.reverse()
         pts = [self.idx_to_world(i, j) for i, j in path_idx]
-        return self._smooth(pts)
+        pts = self._smooth(pts)
+        return self._clear_path(pts)
+
+    def _clear_path(self, pts, target: float = 0.20, iters: int = 6):
+        """Push interior path points away from obstacles to raise clearance.
+
+        This stops the path from hugging the inflated boundary at corners (which
+        otherwise makes the robot graze the boundary and oscillate)."""
+        if len(pts) <= 2:
+            return pts
+        out = [np.array(p, dtype=float) for p in pts]
+        for _ in range(iters):
+            moved = False
+            for k in range(1, len(out) - 1):
+                x, y = out[k]
+                i, j = self.world_to_idx(x, y)
+                if not (0 <= i < self.nx and 0 <= j < self.ny):
+                    continue
+                m = float(self.margin[i, j])
+                if m >= target:
+                    continue
+                di, dj = self.grad_at(i, j)
+                n = math.hypot(di, dj)
+                if n < 1e-6:
+                    continue
+                step = min(target - m, 0.05)
+                nx = x + di / n * step
+                ny = y + dj / n * step
+                ii, jj = self.world_to_idx(nx, ny)
+                if not (0 <= ii < self.nx and 0 <= jj < self.ny):
+                    continue
+                if self.margin[ii, jj] <= m:
+                    continue
+                if not (self._line_free((out[k - 1][0], out[k - 1][1]), (nx, ny))
+                        and self._line_free((nx, ny), (out[k + 1][0], out[k + 1][1]))):
+                    continue
+                out[k] = np.array([nx, ny])
+                moved = True
+            if not moved:
+                break
+        return [(float(p[0]), float(p[1])) for p in out]
 
     def _line_free(self, a: Point, b: Point) -> bool:
         n = int(math.hypot(b[0] - a[0], b[1] - a[1]) / self.res) + 1

@@ -40,7 +40,7 @@ VALID_ARUCO_IDS = set(range(45))
 # Only trust detections in the near frontal region of the base.  This drops far
 # items that would otherwise be mis-associated to the wrong shelf.
 NEAR_FWD_MIN, NEAR_FWD_MAX = 0.15, 1.40
-NEAR_LAT_MAX = 0.80
+NEAR_LAT_MAX = 0.35
 NEAR_Z_MIN, NEAR_Z_MAX = 0.30, 1.50
 
 # Fixed shelf geometry (world frame).  This is public scene structure, NOT the

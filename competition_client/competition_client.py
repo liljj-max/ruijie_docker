@@ -47,10 +47,12 @@ DELIVERY_YAW = -math.pi / 2.0
 APPROACH_DX = 0.068          # base sits this far east of the target column
 SHELF_X = {"A": -1.735, "B": -0.850, "C": 0.035, "D": 0.920, "E": 1.805}
 COLUMN_DX = {"C1": -0.220, "C2": 0.0, "C3": 0.220}
-SCAN_Y = 2.45                # observation lane in front of the shelves
+SCAN_Y = 2.40                # observation lane in front of the shelves (safer)
 SCAN_SLIDE = 0.11            # raise the head to shelf level while scanning
-SCAN_PITCHES = [-0.35, -0.65, -0.95]
+SCAN_YAWS = [-0.30, 0.0, 0.30]          # head_yaw sweep (within +-0.5 limit)
+SCAN_PITCHES = [-0.30, -0.70, -1.10]    # head_pitch sweep (steeper, covers L1-L3)
 TABLE_APPROACH = [-1.88, -2.80]
+OBSTACLE_ENTRY = [-0.50, YELLOW_MID_Y]   # north of the corridor board; avoidance starts here
 
 # manipulation params (from the reference baseline)
 HEAD_PITCH = -0.6
@@ -58,8 +60,8 @@ SLIDE_GRASP = 0.11
 LIFT_AMOUNT = 0.05
 DEPLOY_OFFSET = np.array([-0.011, -0.220, -0.010])
 CREEP_STOP_DY = 0.035
-CREEP_SPEED = 0.10
-RETREAT_SPEED = 0.20
+CREEP_SPEED = 0.08
+RETREAT_SPEED = 0.12
 PLACE_LOWER_SLIDE = 0.17
 DETECT_DWELL = 1.0
 DETECT_MIN_SAMPLES = 4
@@ -69,16 +71,25 @@ REACH_Z_MIN, REACH_Z_MAX = 0.40, 1.35
 GRASP_ROT = np.eye(3)
 
 # scan behaviour
-SCAN_DWELL = 1.2
+SCAN_DWELL = 0.8          # base dwell per view
+SCAN_DWELL_MAX = 2.0      # extend while new detections keep arriving
 SCAN_SETTLE = 0.8
 
+# hard-coded exploration primitives (departure + shelf zone)
+SHELF_STEP = 0.885        # x spacing between shelf observation points
+EXPLORE_X0 = 1.805        # start-x of the north leg (shelf E centre)
+EXPLORE_SPEED = 0.06
+EXPLORE_DRIVE_TOL = 0.06
+EXPLORE_TURN_TOL = 0.03
+EXPLORE_TURN_MAX = 0.15
+
 # phases
-(WAIT_TASK, SCAN, NAV_SHELF, DEPLOY, CREEP, CLOSE, LIFT, RETREAT,
- NAV_TABLE, PLACE, NEXT, DONE, ERROR) = range(13)
+(WAIT_TASK, SCAN, ALIGN, NAV_SHELF, DEPLOY, CREEP, CLOSE, LIFT, RETREAT,
+ RETURN, NAV_TABLE, PLACE, NEXT, DONE, ERROR) = range(15)
 PHASE_NAME = {
-    WAIT_TASK: "wait-task", SCAN: "scan", NAV_SHELF: "nav->shelf",
+    WAIT_TASK: "wait-task", SCAN: "scan", ALIGN: "align", NAV_SHELF: "nav->shelf",
     DEPLOY: "deploy", CREEP: "creep", CLOSE: "close", LIFT: "lift",
-    RETREAT: "retreat", NAV_TABLE: "nav->table", PLACE: "place",
+    RETREAT: "retreat", RETURN: "return", NAV_TABLE: "nav->table", PLACE: "place",
     NEXT: "next", DONE: "done", ERROR: "error",
 }
 
@@ -104,12 +115,23 @@ class CompetitionClient(Node):
         self.pending = []             # remaining task kinds (removed on delivery)
         self.failed_slots = set()     # slots that failed this run
         self.phase_timeouts = {
-            NAV_SHELF: 90.0, DEPLOY: 20.0, CREEP: 30.0,
+            ALIGN: 40.0, RETURN: 30.0, NAV_SHELF: 90.0, DEPLOY: 20.0, CREEP: 30.0,
             NAV_TABLE: 90.0, PLACE: 20.0,
         }
         self.scan_idx = 0
+        self.scan_yaw_idx = 0
         self.scan_pitch_idx = 0
         self.scan_route_set = False
+        self.scan_order = None
+        self.view_t0 = 0.0
+        self.view_start = 0.0
+        self.view_inv = 0
+        self.align_stage = "pos"
+        self.align_settle_t0 = 0.0
+        self.explore_plan = None
+        self.explore_i = 0
+        self.prim_start_xy = None
+        self.prim_start_yaw = 0.0
         self.nav_idx = 0
         self.nav_mode = "turn"
         self.route = []
@@ -162,8 +184,13 @@ class CompetitionClient(Node):
         self.inventory.reset()
         self.pending = [t.kind for t in task.targets]
         self.scan_idx = 0
+        self.scan_yaw_idx = 0
         self.scan_pitch_idx = 0
         self.scan_route_set = False
+        self.scan_order = None
+        self.explore_plan = None
+        self.explore_i = 0
+        self.prim_start_xy = None
         self.get_logger().info(f"new task run={task.run_prefix} kinds={self.pending}")
         self._enter(SCAN)
 
@@ -272,16 +299,16 @@ class CompetitionClient(Node):
 
         # stuck recovery: drive away from the nearest obstacle, then replan
         if now < self.recover_until:
-            self._command_escape(0.18)
+            self._command_escape(0.12)
             return False
 
         # hard safety: never push further if the base centre is inside the
         # inflated obstacles (e.g. drifted into the shelf); back out and replan
         ci, cj = self.planner.world_to_idx(float(a.base_xy[0]), float(a.base_xy[1]))
         if (0 <= ci < self.planner.nx and 0 <= cj < self.planner.ny
-                and float(self.planner.margin[ci, cj]) < 0.05):
+                and float(self.planner.margin[ci, cj]) < 0.02):
             self.get_logger().warn("base inside safety buffer; escaping")
-            self._command_escape(0.18)
+            self._command_escape(0.12)
             self.path = None
             self.replan_t = 0.0
             self.recover_until = self._now() + 1.5
@@ -413,7 +440,7 @@ class CompetitionClient(Node):
                 return di / n, dj / n
         return -math.cos(a.base_yaw), -math.sin(a.base_yaw)
 
-    def _command_escape(self, speed: float = 0.18):
+    def _command_escape(self, speed: float = 0.12):
         """Drive away from the nearest obstacle (forward or reverse, whichever is
         closer to the escape direction) with a damped heading correction."""
         a = self.adapter
@@ -462,14 +489,25 @@ class CompetitionClient(Node):
 
     # ---- target selection ----
     def _select_target(self):
+        """Pick the best pending candidate, preferring the shelf we are at."""
+        bx = float(self.adapter.base_xy[0]) if self.adapter.base_xy is not None else None
+        best = None
         for kind in list(self.pending):
-            cands = [c for c in self.inventory.candidates(kind)
-                     if c.slot not in self.failed_slots]
-            if cands:
-                self.target = cands[0]
-                self.target_kind = kind
-                return True
-        return False
+            for c in self.inventory.candidates(kind):
+                if c.slot in self.failed_slots:
+                    continue
+                score = c.confidence
+                if bx is not None:
+                    sx = SHELF_X.get(c.slot[0])
+                    if sx is not None:
+                        score -= 0.5 * abs(sx - bx)   # prefer the current shelf
+                if best is None or score > best[0]:
+                    best = (score, c, kind)
+        if best is None:
+            return False
+        self.target = best[1]
+        self.target_kind = best[2]
+        return True
 
     def _approach_lane(self):
         s = self.target.slot
@@ -479,13 +517,19 @@ class CompetitionClient(Node):
     def _current_goal(self):
         """World goal for the current navigation phase (for progress checks)."""
         if self.phase == SCAN:
-            idx = min(self.scan_idx, len(SHELF_X) - 1)
-            return (SHELF_X[list(SHELF_X)[idx]], SCAN_Y)
+            return None  # primitive-driven; no progress check needed
         if self.phase == NAV_SHELF and self.target is not None:
             return tuple(self._approach_lane())
         if self.phase == NAV_TABLE:
             return tuple(TABLE_APPROACH)
         return None
+
+    def _ensure_scan_order(self):
+        """Order the shelves nearest-first from the current position."""
+        if self.scan_order is not None or self.adapter.base_xy is None:
+            return
+        self.scan_order = sorted(
+            SHELF_X, key=lambda s: abs(SHELF_X[s] - float(self.adapter.base_xy[0])))
 
     # ---- perception lock during DEPLOY ----
     def _lock_from_products(self):
@@ -552,6 +596,22 @@ class CompetitionClient(Node):
             a.stop_base()
         elif self.phase == SCAN:
             self._tick_scan()
+        elif self.phase == ALIGN:
+            lane = self._approach_lane()
+            if self.align_stage == "pos":
+                if self._drive_to(lane[0], lane[1]):
+                    self.align_stage = "yaw"
+                    self.align_settle_t0 = 0.0
+            else:
+                if self._turn_to(GRASP_YAW):
+                    if self.align_settle_t0 == 0.0:
+                        self.align_settle_t0 = self._now()
+                    elif self._now() - self.align_settle_t0 > 0.3:
+                        self.det_buf.clear()
+                        self.target_locked = False
+                        self._enter(DEPLOY)
+                else:
+                    self.align_settle_t0 = 0.0
         elif self.phase == NAV_SHELF:
             if self._navigate(self._approach_lane(), GRASP_YAW, tol=0.06):
                 self.det_buf.clear()
@@ -596,6 +656,13 @@ class CompetitionClient(Node):
                 a.set_base_velocity(-RETREAT_SPEED, 1.0 * yaw_err)
             else:
                 a.stop_base()
+                self.prim_start_xy = None
+                self._enter(RETURN)
+        elif self.phase == RETURN:
+            # hard-coded axis-aligned run to the obstacle-zone entry, then plan
+            if self._drive_to(OBSTACLE_ENTRY[0], OBSTACLE_ENTRY[1]):
+                self.path = None
+                self.path_goal = None
                 self._enter(NAV_TABLE)
         elif self.phase == NAV_TABLE:
             if self._navigate(TABLE_APPROACH, DELIVERY_YAW):
@@ -623,41 +690,129 @@ class CompetitionClient(Node):
         a.step()
         self._log()
 
+    def _build_scan_plan(self):
+        """Hard-coded departure + shelf exploration plan.
+
+        north -> scan -> [left 90 -> west SHELF_STEP -> right 90 -> scan] x (n-1)
+        """
+        plan = [("goto", (EXPLORE_X0, SCAN_Y)), ("scan",)]
+        for _ in range(len(SHELF_X) - 1):
+            plan += [("turn", math.pi), ("drive", SHELF_STEP),
+                     ("turn", math.pi / 2.0), ("scan",)]
+        return plan
+
+    def _prim_reset(self):
+        self.prim_start_xy = None
+        self.view_t0 = 0.0
+
+    def _drive_to(self, x, y):
+        """Drive to a world point; turn in place first when badly misaligned."""
+        a = self.adapter
+        dx = x - float(a.base_xy[0])
+        dy = y - float(a.base_xy[1])
+        dist = math.hypot(dx, dy)
+        if dist < EXPLORE_DRIVE_TOL:
+            a.stop_base()
+            return True
+        err = wrap_to_pi(math.atan2(dy, dx) - a.base_yaw)
+        v = 0.0 if abs(err) > 0.4 else min(EXPLORE_SPEED, max(0.03, 0.6 * dist))
+        a.set_base_velocity(v, max(-EXPLORE_TURN_MAX, min(EXPLORE_TURN_MAX, 1.0 * err)))
+        return False
+
+    def _turn_to(self, yaw):
+        a = self.adapter
+        err = wrap_to_pi(yaw - a.base_yaw)
+        if abs(err) < EXPLORE_TURN_TOL:
+            a.stop_base()
+            return True
+        a.set_base_velocity(0.0, max(-EXPLORE_TURN_MAX, min(EXPLORE_TURN_MAX, 0.5 * err)))
+        return False
+
+    def _drive_dist(self, dist):
+        a = self.adapter
+        if self.prim_start_xy is None:
+            self.prim_start_xy = a.base_xy.copy()
+            self.prim_start_yaw = a.base_yaw
+        dx = float(a.base_xy[0] - self.prim_start_xy[0])
+        dy = float(a.base_xy[1] - self.prim_start_xy[1])
+        traveled = math.cos(self.prim_start_yaw) * dx + math.sin(self.prim_start_yaw) * dy
+        if abs(traveled - dist) < EXPLORE_DRIVE_TOL:
+            a.stop_base()
+            return True
+        remain = dist - traveled
+        v = max(-EXPLORE_SPEED, min(EXPLORE_SPEED, 0.6 * remain))
+        yaw_err = wrap_to_pi(self.prim_start_yaw - a.base_yaw)
+        a.set_base_velocity(v, max(-EXPLORE_TURN_MAX, min(EXPLORE_TURN_MAX, 1.0 * yaw_err)))
+        return False
+
+    def _do_scan(self):
+        a = self.adapter
+        a.stop_base()
+        a.set_slide(SCAN_SLIDE)
+        a.set_head(SCAN_YAWS[self.scan_yaw_idx], SCAN_PITCHES[self.scan_pitch_idx])
+        now = self._now()
+        if self.view_t0 == 0.0:
+            self.view_t0 = now
+            self.view_start = now
+            self.view_inv = len(self.inventory.all())
+        inv_n = len(self.inventory.all())
+        if inv_n > self.view_inv:
+            self.view_inv = inv_n
+            self.view_t0 = now
+        if (now - self.view_t0 < SCAN_DWELL
+                and now - self.view_start < SCAN_DWELL_MAX):
+            return False
+        self.scan_pitch_idx += 1
+        self.view_t0 = 0.0
+        if self.scan_pitch_idx >= len(SCAN_PITCHES):
+            self.scan_pitch_idx = 0
+            self.scan_yaw_idx += 1
+            if self.scan_yaw_idx >= len(SCAN_YAWS):
+                self.scan_yaw_idx = 0
+                return True
+        return False
+
     def _tick_scan(self):
         a = self.adapter
         # if a pending target is already known, go straight to it
         if self._select_target():
             self._start_nav_shelf()
             return
-        if self.scan_idx >= len(SHELF_X):
-            self._enter(ERROR if self.pending else DONE)
-            return
-        shelf = list(SHELF_X)[self.scan_idx]
-        obs = [SHELF_X[shelf], SCAN_Y]
         if a.base_xy is None:
             a.stop_base()
             return
-        if not self._navigate(obs, None):
+        if self.explore_plan is None:
+            self.explore_plan = self._build_scan_plan()
+            self.explore_i = 0
+            self.scan_yaw_idx = 0
+            self.scan_pitch_idx = 0
+            self.get_logger().info(f"exploration plan: {self.explore_plan}")
+        if self.explore_i >= len(self.explore_plan):
+            self._enter(ERROR if self.pending else DONE)
             return
-        a.stop_base()
-        a.set_slide(SCAN_SLIDE)
-        pitch = SCAN_PITCHES[self.scan_pitch_idx]
-        a.set_head(0.0, pitch)
-        if self._now() - self.state_t0 > SCAN_DWELL:
-            self.scan_pitch_idx += 1
-            self.state_t0 = self._now()
-            if self.scan_pitch_idx >= len(SCAN_PITCHES):
-                self.scan_pitch_idx = 0
-                self.scan_idx += 1
-                self.scan_route_set = False
+        kind, arg = self.explore_plan[self.explore_i]
+        if kind == "goto":
+            done = self._drive_to(arg[0], arg[1])
+        elif kind == "turn":
+            done = self._turn_to(arg)
+        elif kind == "drive":
+            done = self._drive_dist(arg)
+        else:
+            done = self._do_scan()
+        if done:
+            self.explore_i += 1
+            self._prim_reset()
 
     def _start_nav_shelf(self):
         lane = self._approach_lane()
         self.path = None
         self.path_goal = None
+        self.prim_start_xy = None
+        self.align_stage = "pos"
+        self.align_settle_t0 = 0.0
         self.get_logger().info(
             f"target kind={self.target_kind} slot={self.target.slot} lane={lane}")
-        self._enter(NAV_SHELF)
+        self._enter(ALIGN)
 
     def _on_timeout(self):
         phase = self.phase
@@ -682,8 +837,13 @@ class CompetitionClient(Node):
             self._start_nav_shelf()
         elif self.pending:
             self.scan_idx = 0
+            self.scan_yaw_idx = 0
             self.scan_pitch_idx = 0
             self.scan_route_set = False
+            self.scan_order = None
+            self.view_t0 = 0.0
+            self.view_start = 0.0
+            self.view_inv = 0
             self._enter(SCAN)
         else:
             self._enter(DONE)
