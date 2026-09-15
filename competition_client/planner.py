@@ -40,7 +40,10 @@ CORRIDOR_BOARD = (0.515, 0.545, -3.72, 1.70)    # x0, x1, y0, y1  (HIGH, 1.5 m)
 # (paths allowed to pass closer, cost gradient pushes them away).  HIGH covers
 # the arm reach, LOW only the chassis (the stowed arms pass above low obstacles).
 INFLATE_HIGH = 0.45
-INFLATE_LOW = 0.35
+# LOW obstacles (delivery table, random boxes) are inflated by the chassis
+# radius only: 0.35 closes the ~0.59 m fixed-layout corridor gap, 0.25 keeps it
+# passable while the DWB still holds a 0.05 m safety margin.
+INFLATE_LOW = 0.25
 
 # Used only by callers that cannot provide the live base_link->laser TF.
 LASER_OFFSET = (0.1137, 0.0, 0.0)
@@ -53,6 +56,9 @@ MAX_RANGE = 12.0
 PERSIST = 3            # frames an obstacle survives without re-observation
 PREFER_CLEAR = 0.60    # prefer this much margin beyond the inflation radii
 COST_K = 8.0           # weight of the proximity cost (higher = keep to the middle)
+# A* must not plan through gaps the local planner refuses to follow: keep the
+# same clearance the DWB uses as its collision safety.
+BLOCK_MARGIN = 0.05
 
 
 class GridPlanner:
@@ -109,7 +115,7 @@ class GridPlanner:
         d_low = ndimage.distance_transform_edt(~(self.static_low | self.dynamic)) * self.res
         self.margin = np.minimum(d_high - INFLATE_HIGH,
                                  d_low - INFLATE_LOW).astype(np.float32)
-        self.blocked = self.margin <= 0.0
+        self.blocked = self.margin <= BLOCK_MARGIN
         occ_all = self.static_high | self.static_low | self.dynamic
         self.dist_all = (ndimage.distance_transform_edt(~occ_all) * self.res).astype(np.float32)
         self.cost = 1.0 + COST_K * np.clip(

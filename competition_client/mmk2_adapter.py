@@ -210,13 +210,20 @@ class MMK2Adapter(Node):
     def base_stopped(self) -> bool:
         return base_is_stopped(self.base_lin_meas, self.base_ang_meas)
 
-    def pose_at(self, stamp: float, max_dt: float = 0.10):
+    def pose_at(self, stamp: float, max_dt: float = 0.25):
         """Return the odom pose nearest a sensor timestamp."""
         if not self.odom_history:
             return None
         sample = min(self.odom_history, key=lambda item: abs(item[0] - stamp))
         if abs(sample[0] - stamp) > max_dt:
             return None
+        return sample[1].copy(), float(sample[2])
+
+    def latest_pose(self):
+        """Newest odom pose, used when a scan has no time-aligned sample."""
+        if not self.odom_history:
+            return None
+        sample = self.odom_history[-1]
         return sample[1].copy(), float(sample[2])
 
     @property

@@ -49,6 +49,19 @@ DELIVERY_YAW = -math.pi / 2.0
 APPROACH_DX = 0.068          # base sits this far east of the target column
 SHELF_X = {"A": -1.735, "B": -0.850, "C": 0.035, "D": 0.920, "E": 1.805}
 COLUMN_DX = {"C1": -0.220, "C2": 0.0, "C3": 0.220}
+_SHELF_ORDER = ["A", "B", "C", "D", "E"]
+_LEVEL_ORDER = ["L1", "L2", "L3"]
+_COLUMN_ORDER = ["C1", "C2", "C3"]
+
+
+def slot_to_aruco_id(slot):
+    """Map a (shelf, level, column) slot to its fixed ArUco marker id."""
+    try:
+        shelf, level, column = slot
+        return (_SHELF_ORDER.index(shelf) * 9 + _LEVEL_ORDER.index(level) * 3
+                + _COLUMN_ORDER.index(column))
+    except (ValueError, TypeError):
+        return None
 SCAN_Y = 2.40                # observation lane in front of the shelves (safer)
 SCAN_SLIDE = 0.11            # raise the head to shelf level while scanning
 SCAN_YAWS = [-0.30, 0.0, 0.30]          # head_yaw sweep (within +-0.5 limit)
@@ -59,6 +72,10 @@ OBSTACLE_ENTRY = [-0.50, YELLOW_MID_Y]   # north of the corridor board; avoidanc
 # manipulation params (from the reference baseline)
 HEAD_PITCH = -0.6
 SLIDE_GRASP = 0.11
+# The spine (slide) raises/lowers the chest, so the reachable height depends on
+# it.  L1 sits below the reach envelope at SLIDE_GRASP, so lower the chest more
+# for the lower shelves.
+SLIDE_GRASP_BY_LEVEL = {"L1": 0.45, "L2": 0.11, "L3": 0.30}
 LIFT_AMOUNT = 0.05
 DEPLOY_OFFSET = np.array([-0.011, -0.220, -0.010])
 MIN_DEPLOY_FWD = 0.58        # IK has a reach hole closer than ~0.55 m at shelf height
@@ -102,6 +119,9 @@ class CompetitionClient(Node):
         self.products = []
         self.products_seq = 0
         self.aruco = []
+        self.handeye_aruco = []
+        self.handeye_rx_t = 0.0
+        self.fine_adjusted = False
         self.scan_ranges = None
         self.scan_angle_min = 0.0
         self.scan_angle_inc = 0.0
@@ -122,10 +142,10 @@ class CompetitionClient(Node):
         self.pending = []             # remaining TaskTarget objects
         self.failed_slots = set()     # slots that failed this run
         self.phase_timeouts = {
-            STOW: 15.0, ALIGN: 40.0, RETURN: 30.0, NAV_RETURN: 90.0,
+            STOW: 20.0, ALIGN: 40.0, RETURN: 90.0, NAV_RETURN: 90.0,
             DEPLOY: 20.0,
-            WAIT_ARM: 10.0, CREEP: 30.0, BRAKE: 3.0, CLOSE: 4.0,
-            LIFT: 10.0, RETREAT: 20.0, NAV_TABLE: 90.0, PLACE: 20.0,
+            WAIT_ARM: 20.0, CREEP: 30.0, BRAKE: 3.0, CLOSE: 4.0,
+            LIFT: 10.0, RETREAT: 20.0, NAV_TABLE: 150.0, PLACE: 20.0,
         }
         self.scan_yaw_idx = 0
         self.scan_pitch_idx = 0
@@ -152,6 +172,9 @@ class CompetitionClient(Node):
         self.deploy_world = None
         self.grasp_world = None
         self.motion_settle_t0 = 0.0
+        self.grasp_slide = SLIDE_GRASP
+        self.last_arm_dbg = 0.0
+        self.last_nav_dbg = 0.0
         self.stow_next = SCAN
         self.last_log = 0.0
         self.last_dbg = 0.0
@@ -185,6 +208,8 @@ class CompetitionClient(Node):
                                  self._products_cb, 10)
         self.create_subscription(String, "/competition/aruco_detections",
                                  self._aruco_cb, 10)
+        self.create_subscription(String, "/competition/handeye_aruco_detections",
+                                 self._handeye_cb, 10)
         self.create_subscription(LaserScan, "/slamware_ros_sdk_server_node/scan",
                                  self._scan_cb, 10)
 
@@ -261,6 +286,25 @@ class CompetitionClient(Node):
             self.aruco = json.loads(msg.data)
         except Exception:  # noqa: BLE001
             self.aruco = []
+
+    def _handeye_cb(self, msg):
+        try:
+            self.handeye_aruco = json.loads(msg.data)
+        except Exception:  # noqa: BLE001
+            self.handeye_aruco = []
+        self.handeye_rx_t = self._now()
+
+    def _handeye_marker_world(self, slot, max_age: float = 0.5):
+        """Latest fresh hand-eye world position of ``slot``'s ArUco marker."""
+        marker_id = slot_to_aruco_id(slot)
+        if marker_id is None or self._now() - self.handeye_rx_t > max_age:
+            return None
+        for det in self.handeye_aruco:
+            if int(det.get("id", -1)) == marker_id:
+                world = det.get("world")
+                if world is not None and len(world) >= 3:
+                    return np.asarray(world, dtype=float)
+        return None
 
     def _scan_cb(self, msg):
         self.scan_ranges = np.asarray(msg.ranges, dtype=float)
@@ -360,6 +404,11 @@ class CompetitionClient(Node):
                 return True
         return False
 
+    def _nav_abort(self, reason: str):
+        if self._now() - self.last_nav_dbg > 1.0:
+            self.last_nav_dbg = self._now()
+            self.get_logger().warn(f"[nav-abort] {reason}")
+
     def _navigate(self, goal, final_yaw=None, tol: float = 0.15) -> bool:
         """Plan an A* path to ``goal`` and follow it.  Returns True when reached.
 
@@ -372,22 +421,26 @@ class CompetitionClient(Node):
             self.path = None
             self.path_goal = goal
             self.dwb.reset()
-        if self.scan_ranges is None or now - self.scan_rx_t > 0.50:
+        if self.scan_ranges is None or now - self.scan_rx_t > 1.5:
             a.stop_base()
             self.path = None
-            if now - self.last_sensor_warn > 2.0:
-                self.last_sensor_warn = now
-                self.get_logger().warn("LaserScan missing or stale; navigation stopped")
+            self._nav_abort(
+                f"scan stale (age={now - self.scan_rx_t:.2f}s)")
             return False
         if self.mapped_scan_seq != self.scan_seq:
             sensor_pose = self._laser_pose_in_base()
             odom_pose = self.adapter.pose_at(self.scan_stamp)
+            if odom_pose is None:
+                # Fall back to the newest odom (<=~0.2 s stale, ~1 cm) instead
+                # of stopping: a scan frame without a time-aligned sample must
+                # not freeze navigation.
+                odom_pose = self.adapter.latest_pose()
             if sensor_pose is None or odom_pose is None:
                 a.stop_base()
                 self.path = None
-                if odom_pose is None and now - self.last_sensor_warn > 2.0:
-                    self.last_sensor_warn = now
-                    self.get_logger().warn("LaserScan has no time-aligned odom pose")
+                self._nav_abort(
+                    f"no pose (sensor={sensor_pose is not None} "
+                    f"odom={odom_pose is not None})")
                 return False
             scan_xy, scan_yaw = odom_pose
             self.planner.update_scan(
@@ -416,16 +469,22 @@ class CompetitionClient(Node):
 
         # Never issue an unvalidated escape command inside the safety buffer.
         ci, cj = self.planner.world_to_idx(float(a.base_xy[0]), float(a.base_xy[1]))
+        # Trigger the recovery as soon as the DWB's own safety margin is
+        # violated; otherwise the robot deadlocks in the gap between the escape
+        # threshold and the DWB safety (no feasible sample, no escape).
         if (0 <= ci < self.planner.nx and 0 <= cj < self.planner.ny
-                and float(self.planner.margin[ci, cj]) < 0.02):
-            self.get_logger().warn("base inside safety buffer; stopping and replanning")
-            a.stop_base()
+                and float(self.planner.margin[ci, cj]) < self.dwb.safety + 0.01):
+            if self._now() - self.last_sensor_warn > 1.0:
+                self.last_sensor_warn = self._now()
+                self.get_logger().warn("base inside safety buffer; escaping")
+            self._escape_step()
             self.path = None
             self.replan_t = 0.0
             return False
 
         if self.path is None:
             a.stop_base()
+            self._nav_abort("planner returned no path")
             return False
 
         # estimate yaw rate for damping
@@ -459,6 +518,12 @@ class CompetitionClient(Node):
         v, w, _ = self.dwb.compute(
             self.planner, (float(a.base_xy[0]), float(a.base_xy[1])),
             a.base_yaw, self.path, eff_goal)
+        if self._now() - self.last_nav_dbg > 1.0:
+            self.last_nav_dbg = self._now()
+            self.get_logger().info(
+                f"[nav] path={[tuple(np.round(p, 2)) for p in self.path[:6]]} "
+                f"margin={float(self.planner.margin[ci, cj]):.3f} "
+                f"v={v:.3f} w={w:.3f} goal={np.round(eff_goal, 2)}")
         a.set_base_velocity(v, w)
         return False
 
@@ -563,6 +628,37 @@ class CompetitionClient(Node):
         else:
             a.set_base_velocity(-speed, max(-0.30, min(0.30, 0.8 * err_rev)))
 
+    def _laser_min_in_dir(self, bearing: float, half: float = math.radians(30.0)):
+        """Minimum valid LaserScan range around a base-frame bearing."""
+        if self.scan_ranges is None or self.scan_ranges.size == 0:
+            return float("inf")
+        r = self.scan_ranges
+        ang = self.scan_angle_min + self.scan_angle_inc * np.arange(r.size)
+        sensor = self._laser_pose_in_base()
+        syaw = sensor[2] if sensor is not None else 0.0
+        rel = (ang + syaw - bearing + math.pi) % (2.0 * math.pi) - math.pi
+        vals = r[np.abs(rel) <= half]
+        vals = vals[np.isfinite(vals) & (vals > 0.05)]
+        return float(np.min(vals)) if vals.size else float("inf")
+
+    def _escape_step(self, speed: float = 0.06) -> bool:
+        """Validated recovery from the inflation buffer: drive away from the
+        nearest obstacle, but only in a direction the LaserScan says is clear."""
+        a = self.adapter
+        ex, ey = self._escape_dir()
+        desired = math.atan2(ey, ex)
+        err_fwd = wrap_to_pi(desired - a.base_yaw)
+        err_rev = wrap_to_pi(desired + math.pi - a.base_yaw)
+        if abs(err_fwd) <= abs(err_rev):
+            if self._laser_min_in_dir(a.base_yaw) > 0.18:
+                a.set_base_velocity(speed, max(-0.15, min(0.15, 0.8 * err_fwd)))
+                return True
+        elif self._laser_min_in_dir(a.base_yaw + math.pi) > 0.18:
+            a.set_base_velocity(-speed, max(-0.15, min(0.15, 0.8 * err_rev)))
+            return True
+        a.stop_base()
+        return False
+
     def _sector_min(self, a0, a1):
         """Minimum valid range within an angular sector [a0, a1] (rad)."""
         if self.scan_ranges is None or self.scan_ranges.size == 0:
@@ -656,6 +752,40 @@ class CompetitionClient(Node):
         if fp[0] < MIN_DEPLOY_FWD:
             fp[0] = MIN_DEPLOY_FWD
             self.deploy_world = self.adapter.footprint_to_world(fp)
+        self.fine_adjusted = False
+        return True
+
+    def _fine_adjust_target(self):
+        """Refine the grasp x/y once with the hand-eye ArUco marker of the slot.
+
+        The head camera localises the product at ~0.6-0.9 m; the eye-in-hand
+        camera sees the slot marker up close, so its world x/y is used to
+        correct the deploy target while the arm is already at the deploy pose.
+        """
+        if self.fine_adjusted or self.target is None:
+            return False
+        marker = self._handeye_marker_world(self.target.slot)
+        if marker is None:
+            return False
+        self.fine_adjusted = True
+        old_grasp = self.grasp_world.copy()
+        old_deploy = self.deploy_world.copy()
+        dx = float(marker[0] - old_grasp[0])
+        dy = float(marker[1] - old_grasp[1])
+        self.grasp_world = np.array([marker[0], marker[1], old_grasp[2]])
+        self.deploy_world = self.grasp_world + DEPLOY_OFFSET
+        fp = self.adapter.world_to_footprint(self.deploy_world)
+        if fp[0] < MIN_DEPLOY_FWD:
+            fp[0] = MIN_DEPLOY_FWD
+            self.deploy_world = self.adapter.footprint_to_world(fp)
+        if not self.adapter.arm_to("right", self.deploy_world, GRASP_ROT):
+            self.grasp_world = old_grasp
+            self.deploy_world = old_deploy
+            self.get_logger().warn("[fine] marker seen but IK failed; keep head target")
+            return False
+        self.get_logger().info(
+            f"[fine] marker id={slot_to_aruco_id(self.target.slot)} "
+            f"world={np.round(marker, 3)} dx={dx:+.3f} dy={dy:+.3f}")
         return True
 
     # ---- main tick ----
@@ -702,10 +832,21 @@ class CompetitionClient(Node):
         elif self.phase == STOW:
             a.stop_base()
             a.home()
-            settled = (a.arm_settled("right", pos_tol=0.08, vel_tol=0.10)
-                       and abs(a.slide_meas) < 0.03
-                       and a.gripper_settled("right", GRIP_OPEN,
-                                             pos_tol=0.08, vel_tol=0.10))
+            arm_ok = a.arm_settled("right", pos_tol=0.08, vel_tol=0.10)
+            slide_ok = abs(a.slide_meas) < 0.03
+            grip_ok = a.gripper_settled("right", GRIP_OPEN,
+                                        pos_tol=0.08, vel_tol=0.10)
+            if self._now() - self.last_arm_dbg > 0.5:
+                self.last_arm_dbg = self._now()
+                per = np.abs(a.tc[12:18] - a.arm_meas("right"))
+                pos_err, max_vel = a.arm_errors("right")
+                self.get_logger().info(
+                    f"[stow] arm_ok={arm_ok} slide_ok={slide_ok}"
+                    f"({a.slide_meas:.3f}) grip_ok={grip_ok}"
+                    f"({a.gripper_meas('right'):.3f}) "
+                    f"pos_err={pos_err:.3f} max_vel={max_vel:.3f} "
+                    f"per={np.round(per, 3)} jidx={int(np.argmax(per)) + 1}")
+            settled = arm_ok and slide_ok and grip_ok
             if settled:
                 if self.motion_settle_t0 == 0.0:
                     self.motion_settle_t0 = self._now()
@@ -744,14 +885,19 @@ class CompetitionClient(Node):
         elif self.phase == DEPLOY:
             a.stop_base()
             a.set_head(0.0, HEAD_PITCH)
-            a.set_slide(SLIDE_GRASP)
+            a.set_slide(self.grasp_slide)
             a.set_gripper("right", GRIP_OPEN)
             if not self.target_locked and self._now() - self.state_t0 > DETECT_DWELL:
                 if self._lock_from_products():
                     if a.arm_to("right", self.deploy_world, GRASP_ROT):
                         self.target_locked = True
+                        fp = a.world_to_footprint(self.deploy_world)
                         self.get_logger().info(
                             f"locked {self.target_kind} world={np.round(self.deploy_world, 3)}")
+                        self.get_logger().info(
+                            f"[deploy] world={np.round(self.deploy_world, 3)} "
+                            f"fp={np.round(fp, 3)} grasp={np.round(self.grasp_world, 3)} "
+                            f"cmd={np.round(a.tc[12:18], 3)} meas={np.round(a.arm_meas('right'), 3)}")
                         self.motion_settle_t0 = 0.0
                         self._enter(WAIT_ARM)
                     else:
@@ -760,7 +906,22 @@ class CompetitionClient(Node):
                         self.target_tracker.clear()
         elif self.phase == WAIT_ARM:
             a.stop_base()
-            if a.arm_settled("right", pos_tol=0.06, vel_tol=0.08):
+            if self._now() - self.last_arm_dbg > 0.5:
+                self.last_arm_dbg = self._now()
+                per = np.abs(a.tc[12:18] - a.arm_meas("right"))
+                pos_err, max_vel = a.arm_errors("right")
+                ee = a.ee_world("right")
+                self.get_logger().info(
+                    f"[arm] pos_err={pos_err:.3f} max_vel={max_vel:.3f} "
+                    f"per={np.round(per, 3)} jidx={int(np.argmax(per)) + 1} "
+                    f"ee={np.round(ee, 3)} "
+                    f"d_deploy={np.linalg.norm(ee - self.deploy_world):.3f} "
+                    f"d_grasp={np.linalg.norm(ee - self.grasp_world):.3f}")
+            if a.arm_settled("right", pos_tol=0.10, vel_tol=0.08):
+                if self._fine_adjust_target():
+                    # arm re-solved to the marker; wait for it to settle again
+                    self.motion_settle_t0 = 0.0
+                    return
                 if self.motion_settle_t0 == 0.0:
                     self.motion_settle_t0 = self._now()
                 elif self._now() - self.motion_settle_t0 >= 0.3:
@@ -772,7 +933,14 @@ class CompetitionClient(Node):
             ee = a.ee_world("right")
             axis = np.array([math.cos(GRASP_YAW), math.sin(GRASP_YAW)])
             remaining = float(np.dot(self.grasp_world[:2] - ee[:2], axis))
-            speed = creep_speed(remaining, stop_gap=CREEP_STOP_GAP)
+            # drive a little PAST the product centre so the fingers wrap it
+            speed = creep_speed(remaining, stop_gap=-CREEP_STOP_GAP)
+            if self._now() - self.last_arm_dbg > 0.3:
+                self.last_arm_dbg = self._now()
+                self.get_logger().info(
+                    f"[creep] ee={np.round(ee, 3)} grasp={np.round(self.grasp_world, 3)} "
+                    f"remaining={remaining:.3f} speed={speed:.3f} "
+                    f"base=({a.base_xy[0]:.3f},{a.base_xy[1]:.3f})")
             if speed > 0.0:
                 a.set_base_velocity(speed, 1.5 * wrap_to_pi(GRASP_YAW - a.base_yaw))
             else:
@@ -792,18 +960,23 @@ class CompetitionClient(Node):
         elif self.phase == CLOSE:
             a.stop_base()
             a.set_gripper("right", GRIP_CLOSE)
-            if a.gripper_settled("right", GRIP_CLOSE):
-                if self.motion_settle_t0 == 0.0:
-                    self.motion_settle_t0 = self._now()
-                elif self._now() - self.motion_settle_t0 >= 0.3:
-                    self.motion_settle_t0 = 0.0
-                    self._enter(LIFT)
-            else:
-                self.motion_settle_t0 = 0.0
+            meas = a.gripper_meas("right")
+            at_target = abs(meas - GRIP_CLOSE) < 0.05
+            elapsed = self._now() - self.state_t0
+            if self._now() - self.last_arm_dbg > 0.3:
+                self.last_arm_dbg = self._now()
+                self.get_logger().info(
+                    f"[close] meas={meas:.3f} vel={a.gripper_vel('right'):.3f} "
+                    f"target={GRIP_CLOSE:.3f} at_target={at_target} "
+                    f"held={meas > 0.10} t={elapsed:.2f}")
+            if (at_target and elapsed > 0.3) or elapsed > 1.5:
+                self.get_logger().info(
+                    f"[close] done meas={meas:.3f} held={meas > 0.10} t={elapsed:.2f}")
+                self._enter(LIFT)
         elif self.phase == LIFT:
             a.stop_base()
-            a.set_slide(SLIDE_GRASP - LIFT_AMOUNT)
-            if abs(a.slide_meas - (SLIDE_GRASP - LIFT_AMOUNT)) < 0.02:
+            a.set_slide(self.grasp_slide - LIFT_AMOUNT)
+            if abs(a.slide_meas - (self.grasp_slide - LIFT_AMOUNT)) < 0.02:
                 self._enter(RETREAT)
         elif self.phase == RETREAT:
             yaw_err = wrap_to_pi(GRASP_YAW - a.base_yaw)
@@ -815,6 +988,12 @@ class CompetitionClient(Node):
                 self._enter(RETURN)
         elif self.phase == RETURN:
             # hard-coded axis-aligned run to the obstacle-zone entry, then plan
+            if self._now() - self.last_arm_dbg > 1.0:
+                self.last_arm_dbg = self._now()
+                self.get_logger().info(
+                    f"[return] base=({a.base_xy[0]:.2f},{a.base_xy[1]:.2f}) "
+                    f"d_entry="
+                    f"{math.hypot(a.base_xy[0] - OBSTACLE_ENTRY[0], a.base_xy[1] - OBSTACLE_ENTRY[1]):.2f}")
             if self._drive_to(OBSTACLE_ENTRY[0], OBSTACLE_ENTRY[1]):
                 self.path = None
                 self.path_goal = None
@@ -1030,8 +1209,12 @@ class CompetitionClient(Node):
         self.prim_start_xy = None
         self.align_stage = "pos"
         self.align_settle_t0 = 0.0
+        self.fine_adjusted = False
+        level = self.target.slot[1] if self.target is not None else "L2"
+        self.grasp_slide = SLIDE_GRASP_BY_LEVEL.get(level, SLIDE_GRASP)
         self.get_logger().info(
-            f"target kind={self.target_kind} slot={self.target.slot} lane={lane}")
+            f"target kind={self.target_kind} slot={self.target.slot} lane={lane} "
+            f"slide={self.grasp_slide}")
         self._enter(ALIGN)
 
     def _on_timeout(self):
