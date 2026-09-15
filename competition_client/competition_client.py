@@ -183,14 +183,9 @@ class CompetitionClient(Node):
         self.target_kind = None
         self.pending = []             # remaining TaskTarget objects
         self.failed_slots = set()     # slots that failed this run
-        # Generous per-phase timeouts: the base is slow, so give each phase room
-        # to finish rather than aborting mid-route (stability over speed).
-        self.phase_timeouts = {
-            STOW: 30.0, ALIGN: 90.0, RETURN: 200.0, NAV_RETURN: 250.0,
-            DEPLOY: 30.0,
-            WAIT_ARM: 30.0, CREEP: 40.0, BRAKE: 5.0, CLOSE: 6.0,
-            LIFT: 15.0, RETREAT: 30.0, NAV_TABLE: 300.0, PLACE: 40.0,
-        }
+        # 时间限制取消：不设相位超时，允许机器人按自己的节奏走完整个流程
+        # （.get(phase) 返回 None 即视为无超时）。
+        self.phase_timeouts = {}
         self.scan_yaw_idx = 0
         self.scan_pitch_idx = 0
         self.view_t0 = 0.0
