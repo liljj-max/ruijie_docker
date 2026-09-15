@@ -71,21 +71,25 @@
 
 ## 5. 当前实现
 1. 任务 ID 只保留为订单身份，不解析后缀，也不推导货架/层/列。
-2. YOLO 决定商品 kind；ArUco 只映射固定货位。同一 RGB 帧完成关联，并拒绝几何不一致、过远或歧义 marker。
-3. 库存按货位融合多帧类别和世界坐标，抓取前 reserve，失败 release，配送成功 consume。
-4. LaserScan 超过 0.5 秒、odom/JointState 超过 0.75 秒或 scan 找不到 0.1 秒内对应 odom 时立即停车。
-5. 规划路径被新障碍占用时立即重规划；删除未经验证的直接倒车脱困。
+2. YOLO 决定商品 kind；头部 ArUco 只映射固定货位。同一 RGB 帧完成关联，并拒绝几何不一致、过远或歧义 marker。
+3. **右手眼相机（rgt_handeye）接入**：标定其相对右臂末端外参（MuJoCo，光学系=相机系绕 X 转 π），perception 订阅 `/right_camera/color/image_raw`，同帧 ArUco solvePnP 后发布 `/competition/handeye_aruco_detections`（id + world + cam_xyz）。WAIT_ARM 用目标货位 marker 世界 x/y 精修 deploy 目标。
+4. 库存按货位融合多帧类别和世界坐标，抓取前 reserve，失败 release，配送成功 consume。
+5. **抓取修正**：CREEP 越过商品中心 3.5 cm（`stop_gap=-CREEP_STOP_GAP`）使手指包住商品；CLOSE 改为“位置到位或 1.5 s 兜底”并打印 `held`。抓取已多次成功（`[close] done meas≈0.6 held=True`）。
+6. **按层 spine slide**：`SLIDE_GRASP_BY_LEVEL={L1:0.45, L2:0.11, L3:0.30}`，修复 L1（z≈0.57）IK 不可达。
+7. **走廊导航**：LaserScan + A* + DWB；`INFLATE_LOW=0.25`（0.35 会封死固定布局约 0.59 m 的通道）、`BLOCK_MARGIN=0.05` 与 DWB 安全余量一致；scan/odom 配对失败回退最新 odom；脱困阈值对齐 DWB safety；新增“命令了运动但底盘实测不动→倒车”堵转恢复。
 
 ## 6. 已知限制
-1. 官方裁判按匿名 body ID 计分，但相机只提供商品类别、ArUco 只提供货位。若任务仅指定多个同类商品中的某一个实体，在不通过 ID 推导随机货位的约束下不可观测；默认全场任务或按类别选择全部该类商品不受影响。
-2. 固定场景联调确认移动/转向期间不再污染库存；尚未完成一次随机五订单端到端回归。
-3. 当前固定场景未看到 ArUco 检测，需继续验证 marker 可见角度和尺寸参数。
-4. IK 和机械臂到位时间仍需在完整抓取循环中调参。
+1. 官方赛题（比赛方案 PDF）每个订单随附精确货位 `location_id`（如 `SHELF_A_L1_P01`）；但**模拟器把 body 匿名化为 `{id, kind}`、不给货位**。因此模拟器下单目标任务存在“同类非目标”不可区分问题；真实赛题给货位则无此问题（待加 `location_id` 解析）。
+2. 模拟器 LaserScan 实际约 **4 Hz**，且客户端 tick 偶占执行器，scan 时龄可到 ~1 s（阈值已放宽到 1.5 s）。
+3. 固定障碍布局很窄（box_05 与走廊隔板间约 0.59 m），导航仍偶发物理卡死；已加堵转倒车恢复，但端到端尚未稳定走通。
+4. 手眼相机为单目无深度，ArUco 定位精度受标定影响（实测 x 偏差约 2–4 cm）。
+5. 机械臂到位时间与 ALIGN 转向增益仍需调参（偶发 ALIGN 超时）。
 
 ## 7. 下一步计划
-- 随机场景 `SEED=11 TASKS=all` 验证双向走廊 A*/DWB、动态重规划和断流停车。
-- 完成至少一次“扫描中断→抓取配送→复用库存/续扫原货架”的多订单回归。
-- 验证 ArUco 可见率后再调整抓取微调和机械臂分组速度。
+- 稳定固定场景端到端（取-送）后，再跑随机 `SEED` + `TASKS=all/kind` 回归。
+- 解析真实赛题的 `location_id`（`list_config`），在模拟器缺货位时回退扫描。
+- 调 ALIGN 转向增益/去抖，避免超时。
+- 之后考虑 YOLO 训练（9 类）以提升识别率。
 
 ## 8. 常用命令
 ### 启动 Server（固定 Baseline）
