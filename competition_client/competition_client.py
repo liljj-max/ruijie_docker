@@ -71,6 +71,19 @@ OBSTACLE_ENTRY = [-0.50, YELLOW_MID_Y]   # north of the corridor board; avoidanc
 
 # manipulation params (from the reference baseline)
 HEAD_PITCH = -0.6
+# The deploy pose must keep the target in the head camera's view, so the pitch
+# follows the target shelf level (mirrors SCAN_PITCHES).  A fixed -0.6 looked
+# past the L3 (top) row, so L3 targets were never detected and DEPLOY timed out.
+DEPLOY_HEAD_PITCH = {"L1": -1.00, "L2": -0.60, "L3": -0.30}
+# Detection at the deploy pose can still flicker (a target at the edge of the
+# view), so if the target is not locked at the level pitch, sweep a little
+# around it before giving up.
+DEPLOY_PITCH_SWEEP = {
+    "L1": [-1.00, -0.85, -1.15],
+    "L2": [-0.60, -0.45, -0.75],
+    "L3": [-0.30, -0.45, -0.60],
+}
+DEPLOY_PITCH_DWELL = 1.5   # s to hold each pitch before trying the next
 SLIDE_GRASP = 0.11
 # The spine (slide) raises/lowers the chest, so the reachable height depends on
 # it.  L1 sits below the reach envelope at SLIDE_GRASP, so lower the chest more
@@ -173,6 +186,9 @@ class CompetitionClient(Node):
         self.align_stage = "pos"
         self.align_settle_t0 = 0.0
         self.place_sub = 0
+        self.recover_scans = 0
+        self.deploy_pitch_idx = 0
+        self.deploy_pitch_t = 0.0
         self.explore_plan = None
         self.explore_i = 0
         self.scan_complete = False
@@ -268,6 +284,7 @@ class CompetitionClient(Node):
         self.scan_complete = False
         self.scan_views = 0
         self.scanned_shelves = set()
+        self.recover_scans = 0
         self.prim_start_xy = None
         self.target_tracker.clear()
         self.path = None
@@ -348,6 +365,9 @@ class CompetitionClient(Node):
         self.stuck_t0 = self._now()
         if phase == PLACE:
             self.place_sub = 0
+        elif phase == DEPLOY:
+            self.deploy_pitch_idx = 0
+            self.deploy_pitch_t = self._now()
 
     # ---- navigation ----
     def _set_route(self, route, yaw):
@@ -965,26 +985,41 @@ class CompetitionClient(Node):
                     self.align_settle_t0 = 0.0
         elif self.phase == DEPLOY:
             a.stop_base()
-            a.set_head(0.0, HEAD_PITCH)
+            level = self.target.slot[1] if self.target is not None else "L2"
+            sweep = DEPLOY_PITCH_SWEEP.get(
+                level, [DEPLOY_HEAD_PITCH.get(level, HEAD_PITCH)])
+            pitch = sweep[min(self.deploy_pitch_idx, len(sweep) - 1)]
+            a.set_head(0.0, pitch)
             a.set_slide(self.grasp_slide)
             a.set_gripper("right", GRIP_OPEN)
-            if not self.target_locked and self._now() - self.state_t0 > DETECT_DWELL:
-                if self._lock_from_products():
-                    if a.arm_to("right", self.deploy_world, GRASP_ROT):
-                        self.target_locked = True
-                        fp = a.world_to_footprint(self.deploy_world)
-                        self.get_logger().info(
-                            f"locked {self.target_kind} world={np.round(self.deploy_world, 3)}")
-                        self.get_logger().info(
-                            f"[deploy] world={np.round(self.deploy_world, 3)} "
-                            f"fp={np.round(fp, 3)} grasp={np.round(self.grasp_world, 3)} "
-                            f"cmd={np.round(a.tc[12:18], 3)} meas={np.round(a.arm_meas('right'), 3)}")
-                        self.motion_settle_t0 = 0.0
-                        self._enter(WAIT_ARM)
-                    else:
-                        self.get_logger().warn(
-                            f"IK failed for {np.round(self.deploy_world, 3)}, retrying")
+            now = self._now()
+            if not self.target_locked and a.head_settled(0.0, pitch):
+                if now - self.deploy_pitch_t > DETECT_DWELL:
+                    if self._lock_from_products():
+                        if a.arm_to("right", self.deploy_world, GRASP_ROT):
+                            self.target_locked = True
+                            fp = a.world_to_footprint(self.deploy_world)
+                            self.get_logger().info(
+                                f"locked {self.target_kind} world={np.round(self.deploy_world, 3)}")
+                            self.get_logger().info(
+                                f"[deploy] world={np.round(self.deploy_world, 3)} "
+                                f"fp={np.round(fp, 3)} grasp={np.round(self.grasp_world, 3)} "
+                                f"cmd={np.round(a.tc[12:18], 3)} meas={np.round(a.arm_meas('right'), 3)}")
+                            self.motion_settle_t0 = 0.0
+                            self._enter(WAIT_ARM)
+                        else:
+                            self.get_logger().warn(
+                                f"IK failed for {np.round(self.deploy_world, 3)}, retrying")
+                            self.target_tracker.clear()
+                    elif (self.deploy_pitch_idx < len(sweep) - 1
+                          and now - self.deploy_pitch_t > DETECT_DWELL + DEPLOY_PITCH_DWELL):
+                        # target not seen at this pitch: sweep a little and retry
+                        self.deploy_pitch_idx += 1
+                        self.deploy_pitch_t = now
                         self.target_tracker.clear()
+                        self.get_logger().info(
+                            f"[deploy] {level} target not seen at pitch "
+                            f"{pitch:.2f}; trying {sweep[self.deploy_pitch_idx]:.2f}")
         elif self.phase == WAIT_ARM:
             a.stop_base()
             if self._now() - self.last_arm_dbg > 0.5:
@@ -998,7 +1033,12 @@ class CompetitionClient(Node):
                     f"ee={np.round(ee, 3)} "
                     f"d_deploy={np.linalg.norm(ee - self.deploy_world):.3f} "
                     f"d_grasp={np.linalg.norm(ee - self.grasp_world):.3f}")
-            if a.arm_settled("right", pos_tol=0.10, vel_tol=0.08):
+            # Accept the pose when the end-effector is at the deploy target even
+            # if a wrist joint has a residual (L3 reaches a joint-5 limit and
+            # stops ~0.12 rad short while the EE is already within ~3 cm).
+            ee_ok = float(np.linalg.norm(
+                a.ee_world("right") - self.deploy_world)) < 0.05
+            if ee_ok or a.arm_settled("right", pos_tol=0.15, vel_tol=0.08):
                 if self._fine_adjust_target():
                     # arm re-solved to the marker; wait for it to settle again
                     self.motion_settle_t0 = 0.0
@@ -1384,9 +1424,21 @@ class CompetitionClient(Node):
 
     def _recover(self):
         if self.pending and self._select_target():
+            # keep the inventory and go straight to the next candidate: a
+            # failed grasp must not force a full re-scan.
             self.stow_next = ALIGN
             self._enter(STOW)
         elif self.pending and len(self.scanned_shelves) < len(SHELF_X):
+            # continue with the shelves not covered yet
+            self.explore_plan = None
+            self.explore_i = 0
+            self.stow_next = SCAN
+            self._enter(STOW)
+        elif self.pending and self.recover_scans < 1:
+            # every shelf was swept but no candidate for a pending kind: sweep
+            # once more (a target may have been missed) before giving up.
+            self.recover_scans += 1
+            self.scanned_shelves.clear()
             self.explore_plan = None
             self.explore_i = 0
             self.stow_next = SCAN
