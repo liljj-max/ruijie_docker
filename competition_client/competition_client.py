@@ -75,15 +75,16 @@ HEAD_PITCH = -0.6
 # follows the target shelf level (mirrors SCAN_PITCHES).  A fixed -0.6 looked
 # past the L3 (top) row, so L3 targets were never detected and DEPLOY timed out.
 DEPLOY_HEAD_PITCH = {"L1": -1.00, "L2": -0.60, "L3": -0.30}
-# Detection at the deploy pose can still flicker (a target at the edge of the
-# view), so if the target is not locked at the level pitch, sweep a little
-# around it before giving up.
-DEPLOY_PITCH_SWEEP = {
-    "L1": [-1.00, -0.85, -1.15],
-    "L2": [-0.60, -0.45, -0.75],
-    "L3": [-0.30, -0.45, -0.60],
-}
-DEPLOY_PITCH_DWELL = 1.5   # s to hold each pitch before trying the next
+# The scan looks at the shelf with the base at pi/2 and head yaw 0, but the
+# grasp approach turns the base to GRASP_YAW = pi/2 - 11 deg.  The deploy head
+# yaw must compensate, otherwise the (top-shelf) target drops out of the
+# camera's view and can never be locked.
+DEPLOY_HEAD_YAW = wrap_to_pi(math.pi / 2.0 - GRASP_YAW)
+# If the target is still not seen, sweep (dyaw, dpitch) around the level pitch
+# to re-acquire it before giving up.
+DEPLOY_LOOK = [(0.0, 0.0), (0.0, -0.15), (-0.20, 0.0), (0.20, 0.0),
+               (-0.20, -0.15), (0.20, -0.15)]
+DEPLOY_PITCH_DWELL = 1.5   # s to hold each look before trying the next
 SLIDE_GRASP = 0.11
 # The spine (slide) raises/lowers the chest, so the reachable height depends on
 # it.  L1 sits below the reach envelope at SLIDE_GRASP, so lower the chest more
@@ -986,14 +987,15 @@ class CompetitionClient(Node):
         elif self.phase == DEPLOY:
             a.stop_base()
             level = self.target.slot[1] if self.target is not None else "L2"
-            sweep = DEPLOY_PITCH_SWEEP.get(
-                level, [DEPLOY_HEAD_PITCH.get(level, HEAD_PITCH)])
-            pitch = sweep[min(self.deploy_pitch_idx, len(sweep) - 1)]
-            a.set_head(0.0, pitch)
+            base_pitch = DEPLOY_HEAD_PITCH.get(level, HEAD_PITCH)
+            dyaw, dpitch = DEPLOY_LOOK[min(self.deploy_pitch_idx, len(DEPLOY_LOOK) - 1)]
+            yaw = DEPLOY_HEAD_YAW + dyaw
+            pitch = base_pitch + dpitch
+            a.set_head(yaw, pitch)
             a.set_slide(self.grasp_slide)
             a.set_gripper("right", GRIP_OPEN)
             now = self._now()
-            if not self.target_locked and a.head_settled(0.0, pitch):
+            if not self.target_locked and a.head_settled(yaw, pitch):
                 if now - self.deploy_pitch_t > DETECT_DWELL:
                     if self._lock_from_products():
                         if a.arm_to("right", self.deploy_world, GRASP_ROT):
@@ -1011,15 +1013,17 @@ class CompetitionClient(Node):
                             self.get_logger().warn(
                                 f"IK failed for {np.round(self.deploy_world, 3)}, retrying")
                             self.target_tracker.clear()
-                    elif (self.deploy_pitch_idx < len(sweep) - 1
+                    elif (self.deploy_pitch_idx < len(DEPLOY_LOOK) - 1
                           and now - self.deploy_pitch_t > DETECT_DWELL + DEPLOY_PITCH_DWELL):
-                        # target not seen at this pitch: sweep a little and retry
+                        # target not seen here: sweep the head and retry
                         self.deploy_pitch_idx += 1
                         self.deploy_pitch_t = now
                         self.target_tracker.clear()
+                        ny, np_ = DEPLOY_LOOK[self.deploy_pitch_idx]
                         self.get_logger().info(
-                            f"[deploy] {level} target not seen at pitch "
-                            f"{pitch:.2f}; trying {sweep[self.deploy_pitch_idx]:.2f}")
+                            f"[deploy] {level} target not seen at yaw={yaw:.2f} "
+                            f"pitch={pitch:.2f}; trying yaw={DEPLOY_HEAD_YAW + ny:.2f} "
+                            f"pitch={base_pitch + np_:.2f}")
         elif self.phase == WAIT_ARM:
             a.stop_base()
             if self._now() - self.last_arm_dbg > 0.5:
