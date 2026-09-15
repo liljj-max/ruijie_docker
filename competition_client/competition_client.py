@@ -67,7 +67,11 @@ SCAN_SLIDE = 0.11            # raise the head to shelf level while scanning
 SCAN_YAWS = [0.0, -0.15, 0.15]          # level gaze first, then a small deflection
 SCAN_PITCHES = [-0.30, -0.70, -1.10]    # L3, L2, L1 (top shelf first)
 TABLE_APPROACH = [-1.88, -2.80]
-OBSTACLE_ENTRY = [-0.50, YELLOW_MID_Y]   # north of the corridor board; avoidance starts here
+# Fixed entry to the obstacle zone: the midpoint of the shelf-zone / obstacle-
+# zone boundary (dynamic_obstacle_zone_north_mark is at world y=1.70, x spans
+# [-2.42, 0.50]).  Entering from the same pose every time keeps the A* start and
+# heading consistent, instead of a different pose each run.
+OBSTACLE_ENTRY = [-0.96, 1.70]
 
 # manipulation params (from the reference baseline)
 HEAD_PITCH = -0.6
@@ -107,12 +111,13 @@ GRASP_ROT = np.eye(3)
 # just above the surface, releases, then lifts before homing.  The target is a
 # little forward of the table centre so the forward reach stays inside the IK
 # envelope (there is a reach hole closer than ~0.55 m).
-TABLE_PLACE_XY = np.array([-1.94, -3.35])
+TABLE_PLACE_XY = np.array([-1.94, -3.45])  # further over the table centre
 TABLE_TOP_Z = 0.767
 ITEM_HALF_H = 0.0725                       # kele cylinder half-height
 PLACE_HOVER_Z = TABLE_TOP_Z + ITEM_HALF_H + 0.06    # ~0.90: hover above the table
-PLACE_DROP_Z = TABLE_TOP_Z + ITEM_HALF_H + 0.005    # ~0.845: set down (small drop)
+PLACE_DROP_Z = TABLE_TOP_Z + ITEM_HALF_H - 0.005    # ~0.835: set down on the surface
 PLACE_RAISE_Z = 1.00                       # lift clear before homing
+PLACE_RELEASE_DWELL = 1.3                  # s to wait after opening before lifting
 
 # scan behaviour
 SCAN_DWELL = 0.5          # base dwell per view
@@ -1189,8 +1194,8 @@ class CompetitionClient(Node):
                     self.state_t0 = self._now()
                     self.place_sub_t0 = self._now()
             elif self.place_sub == 4:
-                # 5) let the item settle, then lift clear of the table
-                if self._now() - self.state_t0 > 0.8:
+                # 5) let the item settle on the table, then lift clear
+                if self._now() - self.state_t0 > PLACE_RELEASE_DWELL:
                     raise_pose = np.array([place_xy[0], place_xy[1], PLACE_RAISE_Z])
                     if a.arm_to("right", raise_pose, GRASP_ROT):
                         self.place_sub = 5
