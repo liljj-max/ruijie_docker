@@ -95,6 +95,10 @@ EXPLORE_SPEED = 0.10          # straight-line cruise (start -> shelf lane)
 EXPLORE_DRIVE_TOL = 0.06
 EXPLORE_TURN_TOL = 0.03
 EXPLORE_TURN_MAX = 0.15       # turn rate cap (a19bba0 value; avoids swaying)
+# Final in-place alignment before grasping can spin a bit faster than the
+# travel turns (no translation, so the RETURN swaying is not a concern).
+ALIGN_TURN_MAX = 0.22
+ALIGN_TURN_GAIN = 0.7
 
 # phases
 (WAIT_TASK, STOW, SCAN, ALIGN, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE, LIFT,
@@ -418,6 +422,11 @@ class CompetitionClient(Node):
         ``final_yaw`` = None means any final heading is acceptable.
         """
         a = self.adapter
+        # Compliance guard: avoidance planning is ONLY for the obstacle zone.
+        # The departure / shelf / pick zones must use the hard-coded primitives.
+        if self.phase not in (NAV_TABLE, NAV_RETURN):
+            a.stop_base()
+            return False
         now = self._now()
         goal = (float(goal[0]), float(goal[1]))
         if self.path_goal != goal:
@@ -430,32 +439,59 @@ class CompetitionClient(Node):
             self._nav_abort(
                 f"scan stale (age={now - self.scan_rx_t:.2f}s)")
             return False
-        self.planner.update_scan(
-            self.scan_ranges, self.scan_angle_min, self.scan_angle_inc,
-            float(a.base_xy[0]), float(a.base_xy[1]), float(a.base_yaw))
-        if self.path is None or now - self.replan_t > 1.5:
+        if self.mapped_scan_seq != self.scan_seq:
+            sensor_pose = self._laser_pose_in_base()
+            odom_pose = self.adapter.pose_at(self.scan_stamp)
+            if odom_pose is None:
+                # Fall back to the newest odom (<=~0.2 s stale, ~1 cm) instead
+                # of stopping: a scan frame without a time-aligned sample must
+                # not freeze navigation.
+                odom_pose = self.adapter.latest_pose()
+            if sensor_pose is None or odom_pose is None:
+                a.stop_base()
+                self.path = None
+                self._nav_abort(
+                    f"no pose (sensor={sensor_pose is not None} "
+                    f"odom={odom_pose is not None})")
+                return False
+            scan_xy, scan_yaw = odom_pose
+            self.planner.update_scan(
+                self.scan_ranges, self.scan_angle_min, self.scan_angle_inc,
+                float(scan_xy[0]), float(scan_xy[1]), float(scan_yaw),
+                sensor_pose=sensor_pose,
+                range_min=self.scan_range_min, range_max=self.scan_range_max)
+            self.mapped_scan_seq = self.scan_seq
+            if self._planned_path_invalid():
+                self.get_logger().info("planned path blocked; replanning")
+                self.path = None
+                self.replan_t = 0.0
+        if self.path is None or now - self.replan_t > 1.0:
             self.replan_t = now
             self.path = self.planner.plan(
                 (float(a.base_xy[0]), float(a.base_xy[1])), goal)
             if self.path is not None:
+                if math.hypot(self.path[-1][0] - goal[0],
+                              self.path[-1][1] - goal[1]) > 0.25:
+                    self.get_logger().warn("planner moved goal too far; stopping")
+                    self.path = None
+                    a.stop_base()
+                    return False
                 self.get_logger().info(
                     f"planned {len(self.path)} pts -> {np.round(goal, 2)}")
 
-        # stuck recovery: drive away from the nearest obstacle, then replan
-        if now < self.recover_until:
-            self._command_escape(0.12)
-            return False
-
-        # hard safety: never push further if the base centre is inside the
-        # inflated obstacles (e.g. drifted into the shelf); back out and replan
+        # Never issue an unvalidated escape command inside the safety buffer.
         ci, cj = self.planner.world_to_idx(float(a.base_xy[0]), float(a.base_xy[1]))
+        # Trigger the recovery as soon as the DWB's own safety margin is
+        # violated; otherwise the robot deadlocks in the gap between the escape
+        # threshold and the DWB safety (no feasible sample, no escape).
         if (0 <= ci < self.planner.nx and 0 <= cj < self.planner.ny
-                and float(self.planner.margin[ci, cj]) < 0.02):
-            self.get_logger().warn("base inside safety buffer; escaping")
-            self._command_escape(0.12)
+                and float(self.planner.margin[ci, cj]) < self.dwb.safety + 0.01):
+            if self._now() - self.last_sensor_warn > 1.0:
+                self.last_sensor_warn = self._now()
+                self.get_logger().warn("base inside safety buffer; escaping")
+            self._escape_step()
             self.path = None
             self.replan_t = 0.0
-            self.recover_until = self._now() + 1.5
             return False
 
         if self.path is None:
@@ -494,6 +530,8 @@ class CompetitionClient(Node):
         v, w, _ = self.dwb.compute(
             self.planner, (float(a.base_xy[0]), float(a.base_xy[1])),
             a.base_yaw, self.path, eff_goal)
+        if self._stall_recovery():
+            return False
         if self._now() - self.last_nav_dbg > 1.0:
             self.last_nav_dbg = self._now()
             self.get_logger().info(
@@ -882,7 +920,7 @@ class CompetitionClient(Node):
                     self.align_stage = "yaw"
                     self.align_settle_t0 = 0.0
             else:
-                if self._turn_to(GRASP_YAW):
+                if self._turn_to(GRASP_YAW, ALIGN_TURN_MAX, ALIGN_TURN_GAIN):
                     if self.align_settle_t0 == 0.0:
                         self.align_settle_t0 = self._now()
                     elif self._now() - self.align_settle_t0 > 0.3:
@@ -1103,13 +1141,13 @@ class CompetitionClient(Node):
         a.set_base_velocity(v, max(-EXPLORE_TURN_MAX, min(EXPLORE_TURN_MAX, 1.0 * err)))
         return False
 
-    def _turn_to(self, yaw):
+    def _turn_to(self, yaw, max_rate=EXPLORE_TURN_MAX, gain=0.5):
         a = self.adapter
         err = wrap_to_pi(yaw - a.base_yaw)
         if abs(err) < EXPLORE_TURN_TOL:
             a.stop_base()
             return True
-        a.set_base_velocity(0.0, max(-EXPLORE_TURN_MAX, min(EXPLORE_TURN_MAX, 0.5 * err)))
+        a.set_base_velocity(0.0, max(-max_rate, min(max_rate, gain * err)))
         return False
 
     def _drive_dist(self, dist):

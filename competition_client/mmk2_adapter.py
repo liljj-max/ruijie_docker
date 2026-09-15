@@ -56,7 +56,7 @@ SLIDE_MIN, SLIDE_MAX = -0.04, 0.87
 # saturating the wheel PID.  The high-CoG MMK2 tips under aggressive accel, so
 # these stay well below the competition limits (0.45 m/s, 1.2 rad/s,
 # 0.8 m/s^2, 5.0 rad/s^2).
-MAX_LIN, MAX_ANG = 0.12, 0.18
+MAX_LIN, MAX_ANG = 0.08, 0.18
 MAX_LIN_ACC, MAX_ANG_ACC = 0.2, 0.8
 JOINT_SLEW = 1.2  # rad/s for the fastest joint
 
