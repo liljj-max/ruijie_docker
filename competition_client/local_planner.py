@@ -37,9 +37,9 @@ class DWBLocalPlanner:
                  w_osc: float = 0.3, w_prefer_fwd: float = 0.3,
                  w_rotate: float = 1.0, safety: float = 0.05):
         self.v_samples = list(v_samples) if v_samples is not None else \
-            [0.0, 0.02, 0.04, 0.06, 0.08]
+            [0.0, 0.03, 0.06, 0.09, 0.12]
         self.w_samples = list(w_samples) if w_samples is not None else \
-            [-0.18, -0.12, -0.06, 0.0, 0.06, 0.12, 0.18]
+            [i * 0.25 / 3.0 for i in range(-3, 4)]
         self.horizon = horizon
         self.dt = dt
         self.lookahead = lookahead
@@ -118,7 +118,7 @@ class DWBLocalPlanner:
 
         v_samples = list(self.v_samples)
         if allow_reverse:
-            v_samples += [-0.04, -0.08]
+            v_samples += [-0.10, -0.15]
 
         # In tight spots (low clearance) allow deviating from the path to find a
         # wider route, and weight clearance more.

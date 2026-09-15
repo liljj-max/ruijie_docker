@@ -91,10 +91,10 @@ SCAN_DWELL_MAX = 2.0      # extend while new detections keep arriving
 SCAN_SETTLE = 0.8
 
 # hard-coded exploration primitives (departure + shelf zone)
-EXPLORE_SPEED = 0.06
+EXPLORE_SPEED = 0.10          # straight-line cruise (start -> shelf lane)
 EXPLORE_DRIVE_TOL = 0.06
 EXPLORE_TURN_TOL = 0.03
-EXPLORE_TURN_MAX = 0.15
+EXPLORE_TURN_MAX = 0.15       # turn rate cap (a19bba0 value; avoids swaying)
 
 # phases
 (WAIT_TASK, STOW, SCAN, ALIGN, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE, LIFT,
@@ -142,7 +142,7 @@ class CompetitionClient(Node):
         self.pending = []             # remaining TaskTarget objects
         self.failed_slots = set()     # slots that failed this run
         self.phase_timeouts = {
-            STOW: 20.0, ALIGN: 40.0, RETURN: 90.0, NAV_RETURN: 90.0,
+            STOW: 20.0, ALIGN: 60.0, RETURN: 90.0, NAV_RETURN: 90.0,
             DEPLOY: 20.0,
             WAIT_ARM: 20.0, CREEP: 30.0, BRAKE: 3.0, CLOSE: 4.0,
             LIFT: 10.0, RETREAT: 20.0, NAV_TABLE: 150.0, PLACE: 20.0,
@@ -173,7 +173,8 @@ class CompetitionClient(Node):
         self.grasp_world = None
         self.motion_settle_t0 = 0.0
         self.grasp_slide = SLIDE_GRASP
-        self.stuck_move_t0 = 0.0
+        self.stall_ref_xy = None
+        self.stall_ref_t = 0.0
         self.reverse_until = 0.0
         self.last_arm_dbg = 0.0
         self.last_nav_dbg = 0.0
@@ -429,59 +430,32 @@ class CompetitionClient(Node):
             self._nav_abort(
                 f"scan stale (age={now - self.scan_rx_t:.2f}s)")
             return False
-        if self.mapped_scan_seq != self.scan_seq:
-            sensor_pose = self._laser_pose_in_base()
-            odom_pose = self.adapter.pose_at(self.scan_stamp)
-            if odom_pose is None:
-                # Fall back to the newest odom (<=~0.2 s stale, ~1 cm) instead
-                # of stopping: a scan frame without a time-aligned sample must
-                # not freeze navigation.
-                odom_pose = self.adapter.latest_pose()
-            if sensor_pose is None or odom_pose is None:
-                a.stop_base()
-                self.path = None
-                self._nav_abort(
-                    f"no pose (sensor={sensor_pose is not None} "
-                    f"odom={odom_pose is not None})")
-                return False
-            scan_xy, scan_yaw = odom_pose
-            self.planner.update_scan(
-                self.scan_ranges, self.scan_angle_min, self.scan_angle_inc,
-                float(scan_xy[0]), float(scan_xy[1]), float(scan_yaw),
-                sensor_pose=sensor_pose,
-                range_min=self.scan_range_min, range_max=self.scan_range_max)
-            self.mapped_scan_seq = self.scan_seq
-            if self._planned_path_invalid():
-                self.get_logger().info("planned path blocked; replanning")
-                self.path = None
-                self.replan_t = 0.0
-        if self.path is None or now - self.replan_t > 1.0:
+        self.planner.update_scan(
+            self.scan_ranges, self.scan_angle_min, self.scan_angle_inc,
+            float(a.base_xy[0]), float(a.base_xy[1]), float(a.base_yaw))
+        if self.path is None or now - self.replan_t > 1.5:
             self.replan_t = now
             self.path = self.planner.plan(
                 (float(a.base_xy[0]), float(a.base_xy[1])), goal)
             if self.path is not None:
-                if math.hypot(self.path[-1][0] - goal[0],
-                              self.path[-1][1] - goal[1]) > 0.25:
-                    self.get_logger().warn("planner moved goal too far; stopping")
-                    self.path = None
-                    a.stop_base()
-                    return False
                 self.get_logger().info(
                     f"planned {len(self.path)} pts -> {np.round(goal, 2)}")
 
-        # Never issue an unvalidated escape command inside the safety buffer.
+        # stuck recovery: drive away from the nearest obstacle, then replan
+        if now < self.recover_until:
+            self._command_escape(0.12)
+            return False
+
+        # hard safety: never push further if the base centre is inside the
+        # inflated obstacles (e.g. drifted into the shelf); back out and replan
         ci, cj = self.planner.world_to_idx(float(a.base_xy[0]), float(a.base_xy[1]))
-        # Trigger the recovery as soon as the DWB's own safety margin is
-        # violated; otherwise the robot deadlocks in the gap between the escape
-        # threshold and the DWB safety (no feasible sample, no escape).
         if (0 <= ci < self.planner.nx and 0 <= cj < self.planner.ny
-                and float(self.planner.margin[ci, cj]) < self.dwb.safety + 0.01):
-            if self._now() - self.last_sensor_warn > 1.0:
-                self.last_sensor_warn = self._now()
-                self.get_logger().warn("base inside safety buffer; escaping")
-            self._escape_step()
+                and float(self.planner.margin[ci, cj]) < 0.02):
+            self.get_logger().warn("base inside safety buffer; escaping")
+            self._command_escape(0.12)
             self.path = None
             self.replan_t = 0.0
+            self.recover_until = self._now() + 1.5
             return False
 
         if self.path is None:
@@ -520,8 +494,6 @@ class CompetitionClient(Node):
         v, w, _ = self.dwb.compute(
             self.planner, (float(a.base_xy[0]), float(a.base_xy[1])),
             a.base_yaw, self.path, eff_goal)
-        if self._stall_recovery():
-            return False
         if self._now() - self.last_nav_dbg > 1.0:
             self.last_nav_dbg = self._now()
             self.get_logger().info(
@@ -646,21 +618,30 @@ class CompetitionClient(Node):
         return float(np.min(vals)) if vals.size else float("inf")
 
     def _stall_recovery(self) -> bool:
-        """Detect a physically stalled base (commanded but not moving) and back
-        straight out for a moment.  Returns True while the recovery is active."""
+        """Detect a physically stalled base (commanded but the base pose does not
+        change) and back straight out for a moment.
+
+        Uses the odom POSE delta, not the odom twist (the simulator reports a
+        near-zero twist even while the base moves).  Corridor only.
+        """
         a = self.adapter
-        moving = abs(a.base_lin_meas) > 0.005 or abs(a.base_ang_meas) > 0.02
+        now = self._now()
+        if a.base_xy is None:
+            return False
         commanded = abs(a.des_lin) > 0.03 or abs(a.des_ang) > 0.05
-        if commanded and not moving:
-            if self.stuck_move_t0 == 0.0:
-                self.stuck_move_t0 = self._now()
-            elif self._now() - self.stuck_move_t0 > 2.0:
-                self.reverse_until = self._now() + 1.5
-                self.stuck_move_t0 = 0.0
-                self.get_logger().warn("[nav] base stalled; reversing to free")
-        else:
-            self.stuck_move_t0 = 0.0
-        if self._now() < self.reverse_until:
+        if self.stall_ref_xy is None:
+            self.stall_ref_xy = a.base_xy.copy()
+            self.stall_ref_t = now
+        moved = float(np.linalg.norm(a.base_xy - self.stall_ref_xy))
+        if moved > 0.03 or not commanded:
+            self.stall_ref_xy = a.base_xy.copy()
+            self.stall_ref_t = now
+        elif now - self.stall_ref_t > 2.0:
+            self.reverse_until = now + 1.5
+            self.stall_ref_xy = a.base_xy.copy()
+            self.stall_ref_t = now
+            self.get_logger().warn("[nav] base stalled (no pose change); reversing")
+        if now < self.reverse_until:
             if self._laser_min_in_dir(a.base_yaw + math.pi) > 0.20:
                 a.set_base_velocity(-0.08, 0.0)
             else:
@@ -989,6 +970,9 @@ class CompetitionClient(Node):
             a.stop_base()
             a.set_gripper("right", GRIP_CLOSE)
             meas = a.gripper_meas("right")
+            # A stalled width well above the closed target means an object is
+            # between the fingers (an empty close reaches GRIP_CLOSE).
+            held = 0.15 < meas < 0.9
             at_target = abs(meas - GRIP_CLOSE) < 0.05
             elapsed = self._now() - self.state_t0
             if self._now() - self.last_arm_dbg > 0.3:
@@ -996,10 +980,10 @@ class CompetitionClient(Node):
                 self.get_logger().info(
                     f"[close] meas={meas:.3f} vel={a.gripper_vel('right'):.3f} "
                     f"target={GRIP_CLOSE:.3f} at_target={at_target} "
-                    f"held={meas > 0.10} t={elapsed:.2f}")
+                    f"held={held} t={elapsed:.2f}")
             if (at_target and elapsed > 0.3) or elapsed > 1.5:
                 self.get_logger().info(
-                    f"[close] done meas={meas:.3f} held={meas > 0.10} t={elapsed:.2f}")
+                    f"[close] done meas={meas:.3f} held={held} t={elapsed:.2f}")
                 self._enter(LIFT)
         elif self.phase == LIFT:
             a.stop_base()
@@ -1007,9 +991,10 @@ class CompetitionClient(Node):
             if abs(a.slide_meas - (self.grasp_slide - LIFT_AMOUNT)) < 0.02:
                 self._enter(RETREAT)
         elif self.phase == RETREAT:
-            yaw_err = wrap_to_pi(GRASP_YAW - a.base_yaw)
+            # Back straight out of the shelf (no heading correction) so the
+            # held item is not swung; the turn happens afterwards in RETURN.
             if a.base_xy[1] > YELLOW_MID_Y + 0.06:
-                a.set_base_velocity(-RETREAT_SPEED, 1.0 * yaw_err)
+                a.set_base_velocity(-RETREAT_SPEED, 0.0)
             else:
                 a.stop_base()
                 self.prim_start_xy = None
@@ -1101,10 +1086,12 @@ class CompetitionClient(Node):
         self.view_products_seq = -1
 
     def _drive_to(self, x, y):
-        """Drive to a world point; turn in place first when badly misaligned."""
+        """Drive to a world point; turn in place first when badly misaligned.
+
+        This is a hard-coded primitive for the departure / shelf zone: it never
+        consults the LaserScan, the planner or any recovery (competition rule).
+        """
         a = self.adapter
-        if self._stall_recovery():
-            return False
         dx = x - float(a.base_xy[0])
         dy = y - float(a.base_xy[1])
         dist = math.hypot(dx, dy)

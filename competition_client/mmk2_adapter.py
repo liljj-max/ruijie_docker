@@ -47,13 +47,16 @@ JOINT_NAMES = [
 INIT_ARM_L = [0.0, -0.166, 0.032, 0.0, 1.571, 2.223]
 INIT_ARM_R = [0.0, -0.166, 0.032, 0.0, -1.571, -2.223]
 
-GRIP_OPEN, GRIP_CLOSE = 1.0, 0.08
+GRIP_OPEN, GRIP_CLOSE = 1.0, 0.02
 SLIDE_MIN, SLIDE_MAX = -0.04, 0.87
 
 # Safety limits / achievable envelope.  The server's base responds to /cmd_vel
-# at roughly 1/8 of the commanded value (measured), so a publish-time gain maps
-# the physical command into the responsive range without saturating the wheel PID.
-MAX_LIN, MAX_ANG = 0.08, 0.18
+# at roughly 1/8 (linear) and ~1/4 (angular) of the commanded value, so the
+# publish-time gains map the physical command into the responsive range without
+# saturating the wheel PID.  The high-CoG MMK2 tips under aggressive accel, so
+# these stay well below the competition limits (0.45 m/s, 1.2 rad/s,
+# 0.8 m/s^2, 5.0 rad/s^2).
+MAX_LIN, MAX_ANG = 0.12, 0.18
 MAX_LIN_ACC, MAX_ANG_ACC = 0.2, 0.8
 JOINT_SLEW = 1.2  # rad/s for the fastest joint
 

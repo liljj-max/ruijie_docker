@@ -40,25 +40,19 @@ CORRIDOR_BOARD = (0.515, 0.545, -3.72, 1.70)    # x0, x1, y0, y1  (HIGH, 1.5 m)
 # (paths allowed to pass closer, cost gradient pushes them away).  HIGH covers
 # the arm reach, LOW only the chassis (the stowed arms pass above low obstacles).
 INFLATE_HIGH = 0.45
-# LOW obstacles (delivery table, random boxes) are inflated by the chassis
-# radius only: 0.35 closes the ~0.59 m fixed-layout corridor gap, 0.25 keeps it
-# passable while the DWB still holds a 0.05 m safety margin.
 INFLATE_LOW = 0.25
 
-# Used only by callers that cannot provide the live base_link->laser TF.
-LASER_OFFSET = (0.1137, 0.0, 0.0)
+# Laser mounted 0.1137 m ahead of base_link (from the static TF).
+LASER_OFFSET = (0.1137, 0.0)
 # Footprint half extents used to drop self returns (range_filter footprint mode).
 FOOT_HALF_X = 0.35
 FOOT_HALF_Y = 0.35
 
-MIN_RANGE = 0.05
+MIN_RANGE = 0.25
 MAX_RANGE = 12.0
 PERSIST = 3            # frames an obstacle survives without re-observation
 PREFER_CLEAR = 0.60    # prefer this much margin beyond the inflation radii
 COST_K = 8.0           # weight of the proximity cost (higher = keep to the middle)
-# A* must not plan through gaps the local planner refuses to follow: keep the
-# same clearance the DWB uses as its collision safety.
-BLOCK_MARGIN = 0.05
 
 
 class GridPlanner:
@@ -115,7 +109,7 @@ class GridPlanner:
         d_low = ndimage.distance_transform_edt(~(self.static_low | self.dynamic)) * self.res
         self.margin = np.minimum(d_high - INFLATE_HIGH,
                                  d_low - INFLATE_LOW).astype(np.float32)
-        self.blocked = self.margin <= BLOCK_MARGIN
+        self.blocked = self.margin <= 0.0
         occ_all = self.static_high | self.static_low | self.dynamic
         self.dist_all = (ndimage.distance_transform_edt(~occ_all) * self.res).astype(np.float32)
         self.cost = 1.0 + COST_K * np.clip(
@@ -131,9 +125,7 @@ class GridPlanner:
 
     # ---- dynamic layer from the 360 LaserScan ----
     def update_scan(self, ranges, angle_min: float, angle_inc: float,
-                    rx: float, ry: float, ryaw: float,
-                    sensor_pose=LASER_OFFSET, range_min: float = MIN_RANGE,
-                    range_max: float = MAX_RANGE) -> None:
+                    rx: float, ry: float, ryaw: float) -> None:
         """Ray-cast the scan into the dynamic layer (marking + clearing)."""
         self.hits = np.maximum(self.hits - 1, 0)
         if ranges is None or len(ranges) == 0:
@@ -145,16 +137,12 @@ class GridPlanner:
         n = r.size
         ang = angle_min + angle_inc * np.arange(n)
 
-        sx, sy, syaw = sensor_pose
-        lx = rx + math.cos(ryaw) * sx - math.sin(ryaw) * sy
-        ly = ry + math.sin(ryaw) * sx + math.cos(ryaw) * sy
+        lx = rx + math.cos(ryaw) * LASER_OFFSET[0] - math.sin(ryaw) * LASER_OFFSET[1]
+        ly = ry + math.sin(ryaw) * LASER_OFFSET[0] + math.cos(ryaw) * LASER_OFFSET[1]
 
-        min_r = max(MIN_RANGE, float(range_min))
-        max_r = min(MAX_RANGE, float(range_max))
-        valid = np.isfinite(r) & (r > min_r) & (r < max_r)
-        bang = syaw + ang
-        ex_b = sx + r * np.cos(bang)
-        ey_b = sy + r * np.sin(bang)
+        valid = np.isfinite(r) & (r > MIN_RANGE) & (r < MAX_RANGE)
+        ex_b = r * np.cos(ang) + LASER_OFFSET[0]
+        ey_b = r * np.sin(ang)
         inside = (np.abs(ex_b) <= FOOT_HALF_X) & (np.abs(ey_b) <= FOOT_HALF_Y)
         valid &= ~inside
         if not np.any(valid):
@@ -162,7 +150,7 @@ class GridPlanner:
             self._recompute()
             return
 
-        wang = ryaw + bang
+        wang = ryaw + ang
         rv = np.where(valid, r, 0.0)
 
         d = np.arange(0.0, MAX_RANGE, self.res)
