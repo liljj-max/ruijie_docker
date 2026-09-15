@@ -64,8 +64,8 @@ def slot_to_aruco_id(slot):
         return None
 SCAN_Y = 2.40                # observation lane in front of the shelves (safer)
 SCAN_SLIDE = 0.11            # raise the head to shelf level while scanning
-SCAN_YAWS = [-0.30, 0.0, 0.30]          # head_yaw sweep (within +-0.5 limit)
-SCAN_PITCHES = [-0.30, -0.70, -1.10]    # head_pitch sweep (steeper, covers L1-L3)
+SCAN_YAWS = [0.0, -0.15, 0.15]          # level gaze first, then a small deflection
+SCAN_PITCHES = [-0.30, -0.70, -1.10]    # L3, L2, L1 (top shelf first)
 TABLE_APPROACH = [-1.88, -2.80]
 OBSTACLE_ENTRY = [-0.50, YELLOW_MID_Y]   # north of the corridor board; avoidance starts here
 
@@ -1322,6 +1322,8 @@ class CompetitionClient(Node):
         if (now - self.view_t0 < SCAN_DWELL
                 and now - self.view_start < SCAN_DWELL_MAX):
             return False
+        # persist this look's detections (kind -> slot candidates) immediately
+        self.inventory.update(self.products)
         self.scan_pitch_idx += 1
         self.view_t0 = 0.0
         self.view_start = 0.0
@@ -1338,9 +1340,9 @@ class CompetitionClient(Node):
 
     def _tick_scan(self):
         a = self.adapter
-        # Orders are all known up front.  Stop searching as soon as any pending
-        # kind has a stable inventory candidate; completed shelf coverage and
-        # all earlier observations remain cached for subsequent orders.
+        # Each shelf is swept completely (all levels) the first time it is
+        # visited, so its inventory is fully known before deciding what to do;
+        # only then is any known target grasped (preferring the current shelf).
         if a.base_xy is None:
             a.stop_base()
             return
@@ -1350,11 +1352,6 @@ class CompetitionClient(Node):
             self.scan_yaw_idx = 0
             self.scan_pitch_idx = 0
             self.get_logger().info(f"exploration plan: {self.explore_plan}")
-        if (self.explore_i < len(self.explore_plan)
-                and self.explore_plan[self.explore_i][0] == "scan"
-                and self._select_target()):
-            self._start_nav_shelf()
-            return
         if self.explore_i >= len(self.explore_plan):
             if self._select_target():
                 self._start_nav_shelf()
@@ -1378,6 +1375,13 @@ class CompetitionClient(Node):
         if done:
             if kind == "scan" and arg is not None:
                 self.scanned_shelves.add(arg)
+                self.get_logger().info(
+                    f"scanned shelf {arg}; coverage={sorted(self.scanned_shelves)}")
+                # shelf inventory is complete: grasp any known target (the
+                # current shelf is preferred), otherwise continue scanning.
+                if self._select_target():
+                    self._start_nav_shelf()
+                    return
             self.explore_i += 1
             self._prim_reset()
 
