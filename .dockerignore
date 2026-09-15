@@ -1,0 +1,11 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.log
+.pytest_cache
+*.downloading
+tools/yolov8s.pt
+Dockerfile.delivery
+.dockerignore

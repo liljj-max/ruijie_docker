@@ -225,6 +225,8 @@ class CompetitionClient(Node):
         self.stall_ref_xy = None
         self.stall_ref_t = 0.0
         self.reverse_until = 0.0
+        self.stall_count = 0
+        self.stall_spot = None
         self.last_arm_dbg = 0.0
         self.last_nav_dbg = 0.0
         self.stow_next = SCAN
@@ -743,13 +745,25 @@ class CompetitionClient(Node):
             self.stall_ref_t = now
         moved = float(np.linalg.norm(a.base_xy - self.stall_ref_xy))
         if moved > 0.03 or not commanded:
+            # Real progress away from the last wedge resets the escalation.
+            if (self.stall_spot is not None
+                    and float(np.linalg.norm(a.base_xy - self.stall_spot)) > 0.40):
+                self.stall_count = 0
+                self.stall_spot = None
             self.stall_ref_xy = a.base_xy.copy()
             self.stall_ref_t = now
         elif now - self.stall_ref_t > 2.0:
-            self.reverse_until = now + 1.5
+            # Repeated stalls near the same spot: back out progressively further
+            # so the base actually clears the wedge instead of nosing straight
+            # back into it.
+            self.stall_count += 1
+            self.stall_spot = a.base_xy.copy()
+            back = 1.5 + min(2.5, 0.8 * (self.stall_count - 1))
+            self.reverse_until = now + back
             self.stall_ref_xy = a.base_xy.copy()
             self.stall_ref_t = now
-            self.get_logger().warn("[nav] base stalled (no pose change); reversing")
+            self.get_logger().warn(
+                f"[nav] base stalled (no pose change); reversing {back:.1f}s")
         if now < self.reverse_until:
             if self._laser_min_in_dir(a.base_yaw + math.pi) > 0.20:
                 a.set_base_velocity(-0.08, 0.0)

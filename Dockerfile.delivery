@@ -1,0 +1,24 @@
+# Self-contained delivery image for the supermarket sorting competition.
+#
+# Built on the official client image so the runtime environment (ROS 2 Humble,
+# ultralytics, control interfaces) matches exactly.  The competition code is
+# baked into the image at /workspace/baseline, so the organisers only need to
+# `docker load` this image and run it -- no host mount required.
+#
+#   docker build -f Dockerfile.delivery -t ruijie_delivery:client .
+#   docker run --gpus all --network host --ipc host \
+#     -e ROS_DOMAIN_ID=99 -e RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+#     ruijie_delivery:client
+#
+FROM supermarket_sorting:client
+
+# Copy the whole repository (weights included) into the image.
+COPY . /workspace/baseline
+
+WORKDIR /workspace/baseline
+ENV ROS_DOMAIN_ID=99 \
+    RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+# The official entrypoint sources /opt/ros/humble and execs the CMD, so the
+# container starts the perception node + main client immediately.
+CMD ["bash", "scripts/run_competition.sh"]
