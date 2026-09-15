@@ -35,7 +35,7 @@ class DWBLocalPlanner:
                  w_clear: float = 0.6, w_speed: float = 0.8,
                  w_omega: float = 0.2, w_smooth: float = 0.4,
                  w_osc: float = 0.3, w_prefer_fwd: float = 0.3,
-                 w_rotate: float = 1.0, safety: float = 0.05):
+                 w_rotate: float = 1.0, safety: float = 0.02):
         self.v_samples = list(v_samples) if v_samples is not None else \
             [0.0, 0.02, 0.04, 0.06, 0.08]
         self.w_samples = list(w_samples) if w_samples is not None else \

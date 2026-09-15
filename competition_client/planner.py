@@ -57,8 +57,13 @@ PERSIST = 3            # frames an obstacle survives without re-observation
 PREFER_CLEAR = 0.60    # prefer this much margin beyond the inflation radii
 COST_K = 8.0           # weight of the proximity cost (higher = keep to the middle)
 # A* must not plan through gaps the local planner refuses to follow: keep the
-# same clearance the DWB uses as its collision safety.
-BLOCK_MARGIN = 0.05
+# same clearance the DWB uses as its collision safety.  It also has to stay
+# within the server's guaranteed traversability (obstacle_layout's
+# ROBOT_CLEARANCE_RADIUS = 0.347 m): a larger margin (0.05) made the global
+# planner reject random layouts the server considers passable, returning no
+# path.  0.02 keeps INFLATE_HIGH + BLOCK_MARGIN = 0.47, still covering the
+# stowed arm reach (~0.435 m) near the corridor board / walls.
+BLOCK_MARGIN = 0.02
 
 
 class GridPlanner:

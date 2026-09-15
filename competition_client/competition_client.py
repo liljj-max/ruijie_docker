@@ -85,6 +85,18 @@ PLACE_LOWER_SLIDE = 0.17
 DETECT_DWELL = 1.0
 GRASP_ROT = np.eye(3)
 
+# Placement on the fixed delivery table (world frame).  The base faces south at
+# TABLE_APPROACH; the right arm reaches forward over the table top, lowers to
+# just above the surface, releases, then lifts before homing.  The target is a
+# little forward of the table centre so the forward reach stays inside the IK
+# envelope (there is a reach hole closer than ~0.55 m).
+TABLE_PLACE_XY = np.array([-1.94, -3.35])
+TABLE_TOP_Z = 0.767
+ITEM_HALF_H = 0.0725                       # kele cylinder half-height
+PLACE_HOVER_Z = TABLE_TOP_Z + ITEM_HALF_H + 0.06    # ~0.90: hover above the table
+PLACE_DROP_Z = TABLE_TOP_Z + ITEM_HALF_H + 0.005    # ~0.845: set down (small drop)
+PLACE_RAISE_Z = 1.00                       # lift clear before homing
+
 # scan behaviour
 SCAN_DWELL = 0.8          # base dwell per view
 SCAN_DWELL_MAX = 2.0      # extend while new detections keep arriving
@@ -149,7 +161,7 @@ class CompetitionClient(Node):
             STOW: 20.0, ALIGN: 60.0, RETURN: 90.0, NAV_RETURN: 90.0,
             DEPLOY: 20.0,
             WAIT_ARM: 20.0, CREEP: 30.0, BRAKE: 3.0, CLOSE: 4.0,
-            LIFT: 10.0, RETREAT: 20.0, NAV_TABLE: 150.0, PLACE: 20.0,
+            LIFT: 10.0, RETREAT: 20.0, NAV_TABLE: 150.0, PLACE: 30.0,
         }
         self.scan_yaw_idx = 0
         self.scan_pitch_idx = 0
@@ -160,6 +172,7 @@ class CompetitionClient(Node):
         self.view_inv = 0
         self.align_stage = "pos"
         self.align_settle_t0 = 0.0
+        self.place_sub = 0
         self.explore_plan = None
         self.explore_i = 0
         self.scan_complete = False
@@ -333,6 +346,8 @@ class CompetitionClient(Node):
         self.stuck_goal = None
         self.stuck_best_d = None
         self.stuck_t0 = self._now()
+        if phase == PLACE:
+            self.place_sub = 0
 
     # ---- navigation ----
     def _set_route(self, route, yaw):
@@ -530,6 +545,25 @@ class CompetitionClient(Node):
         v, w, _ = self.dwb.compute(
             self.planner, (float(a.base_xy[0]), float(a.base_xy[1])),
             a.base_yaw, self.path, eff_goal)
+        # Deadlock: every forward arc collides and "do nothing" wins the score,
+        # so the DWB returns (0, 0).  Neither the stall recovery (needs a
+        # nonzero command) nor the buffer escape (needs a low margin) fires, so
+        # the robot sits until the phase times out.  Break it explicitly.
+        if abs(v) < 1e-3 and abs(w) < 1e-3:
+            if self._now() - self.last_sensor_warn > 1.0:
+                self.last_sensor_warn = self._now()
+                self.get_logger().warn(
+                    "[nav] local planner deadlock; escaping/rotating")
+            if not self._escape_step():
+                tgt = self.path[1] if len(self.path) >= 2 else eff_goal
+                heading = math.atan2(tgt[1] - a.base_xy[1],
+                                     tgt[0] - a.base_xy[0])
+                a.set_base_velocity(
+                    0.0, max(-0.18, min(0.18,
+                                        0.8 * wrap_to_pi(heading - a.base_yaw))))
+            self.path = None
+            self.replan_t = 0.0
+            return False
         if self._stall_recovery():
             return False
         if self._now() - self.last_nav_dbg > 1.0:
@@ -1053,12 +1087,57 @@ class CompetitionClient(Node):
             if self._navigate(TABLE_APPROACH, DELIVERY_YAW):
                 self._enter(PLACE)
         elif self.phase == PLACE:
+            # Reach forward over the fixed table, lower to just above the top,
+            # release, then lift clear and home.  Keeps the item upright so it
+            # lands stably instead of dropping from height.
             a.stop_base()
-            a.set_slide(PLACE_LOWER_SLIDE)
-            if abs(a.slide_meas - PLACE_LOWER_SLIDE) < 0.03:
-                a.set_gripper("right", GRIP_OPEN)
-                if self._now() - self.state_t0 > 1.0:
+            place_xy = TABLE_PLACE_XY
+            if self.place_sub == 0:
+                # 1) lower the spine (arm joints unchanged) as in the baseline
+                a.set_slide(PLACE_LOWER_SLIDE)
+                if abs(a.slide_meas - PLACE_LOWER_SLIDE) < 0.03:
+                    self.place_sub = 1
+            elif self.place_sub == 1:
+                # 2) reach forward to hover above the table
+                hover = np.array([place_xy[0], place_xy[1], PLACE_HOVER_Z])
+                if a.arm_to("right", hover, GRASP_ROT):
+                    self.place_sub = 2
+                else:
+                    self.get_logger().warn(
+                        "place hover IK failed; releasing in place")
+                    self.place_sub = 3
+            elif self.place_sub == 2:
+                # 3) wait for the hover pose, then lower onto the table
+                if a.arm_settled("right", pos_tol=0.08, vel_tol=0.08):
+                    drop = np.array([place_xy[0], place_xy[1], PLACE_DROP_Z])
+                    if a.arm_to("right", drop, GRASP_ROT):
+                        self.place_sub = 3
+            elif self.place_sub == 3:
+                # 4) once settled just above the surface, open the gripper
+                if a.arm_settled("right", pos_tol=0.05, vel_tol=0.05):
+                    a.set_gripper("right", GRIP_OPEN)
+                    self.place_sub = 4
+                    self.state_t0 = self._now()
+            elif self.place_sub == 4:
+                # 5) let the item settle, then lift clear of the table
+                if self._now() - self.state_t0 > 0.8:
+                    raise_pose = np.array([place_xy[0], place_xy[1], PLACE_RAISE_Z])
+                    if a.arm_to("right", raise_pose, GRASP_ROT):
+                        self.place_sub = 5
+                    else:
+                        a.home()
+                        self._enter(NEXT)
+            elif self.place_sub == 5:
+                # 6) tuck the arm, then continue
+                if a.arm_settled("right", pos_tol=0.10, vel_tol=0.08):
+                    a.home()
                     self._enter(NEXT)
+            if self._now() - self.last_arm_dbg > 0.5:
+                self.last_arm_dbg = self._now()
+                self.get_logger().info(
+                    f"[place] sub={self.place_sub} slide={a.slide_meas:.3f} "
+                    f"ee={np.round(a.ee_world('right'), 3)} "
+                    f"grip={a.gripper_meas('right'):.3f}")
         elif self.phase == NEXT:
             if self.target is not None:
                 self.inventory.consume(self.target.slot)
