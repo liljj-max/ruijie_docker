@@ -71,7 +71,7 @@ TABLE_APPROACH = [-1.88, -2.80]
 # zone boundary (dynamic_obstacle_zone_north_mark is at world y=1.70, x spans
 # [-2.42, 0.50]).  Entering from the same pose every time keeps the A* start and
 # heading consistent, instead of a different pose each run.
-OBSTACLE_ENTRY = [-0.96, 1.70]
+OBSTACLE_ENTRY = [-0.50, YELLOW_MID_Y]   # north of the corridor board; avoidance starts here
 
 # manipulation params (from the reference baseline)
 HEAD_PITCH = -0.6
