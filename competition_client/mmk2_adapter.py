@@ -18,6 +18,7 @@ Layout of ``tc`` (19 elements):
 from __future__ import annotations
 
 import math
+from collections import deque
 from typing import Optional
 
 import numpy as np
@@ -91,6 +92,9 @@ class MMK2Adapter(Node):
         self.base_ang_meas = 0.0
         self.jpos: dict = {}
         self.jvel: dict = {}
+        self.odom_rx_t: Optional[float] = None
+        self.joint_rx_t: Optional[float] = None
+        self.odom_history = deque(maxlen=64)
 
         self.cmd_vel_pub = self.create_publisher(Twist, "/cmd_vel", 5)
         self.spine_pub = self.create_publisher(
@@ -114,16 +118,27 @@ class MMK2Adapter(Node):
         self.base_yaw = Rotation.from_quat([q.x, q.y, q.z, q.w]).as_euler("xyz")[2]
         self.base_lin_meas = float(msg.twist.twist.linear.x)
         self.base_ang_meas = float(msg.twist.twist.angular.z)
+        self.odom_rx_t = self.get_clock().now().nanoseconds * 1e-9
+        stamp = float(msg.header.stamp.sec) + msg.header.stamp.nanosec * 1e-9
+        if stamp <= 0.0:
+            stamp = self.odom_rx_t
+        self.odom_history.append((stamp, self.base_xy.copy(), self.base_yaw))
 
     def _js_cb(self, msg: JointState) -> None:
         self.jpos = {n: msg.position[i] for i, n in enumerate(msg.name)
                      if i < len(msg.position)}
         self.jvel = {n: msg.velocity[i] for i, n in enumerate(msg.name)
                      if i < len(msg.velocity)}
+        self.joint_rx_t = self.get_clock().now().nanoseconds * 1e-9
 
     @property
     def ready(self) -> bool:
-        return self.base_xy is not None and bool(self.jpos)
+        if self.base_xy is None or not self.jpos:
+            return False
+        now = self.get_clock().now().nanoseconds * 1e-9
+        return (self.odom_rx_t is not None and self.joint_rx_t is not None
+                and now - self.odom_rx_t <= 0.75
+                and now - self.joint_rx_t <= 0.75)
 
     @property
     def slide_meas(self) -> float:
@@ -153,6 +168,30 @@ class MMK2Adapter(Node):
             self.tc[base:base + 6], self.arm_meas(side), self.arm_vel(side),
             position_tolerance=pos_tol, velocity_tolerance=vel_tol)
 
+    def arm_errors(self, side: str):
+        base = 5 if side == "left" else 12
+        pos_err = float(np.max(np.abs(self.tc[base:base + 6] - self.arm_meas(side))))
+        max_vel = float(np.max(np.abs(self.arm_vel(side))))
+        return pos_err, max_vel
+
+    def head_meas(self) -> np.ndarray:
+        return np.array([
+            self.jpos.get("head_yaw_joint", self.tc[3]),
+            self.jpos.get("head_pitch_joint", self.tc[4]),
+        ])
+
+    def head_vel(self) -> np.ndarray:
+        return np.array([
+            self.jvel.get("head_yaw_joint", float("inf")),
+            self.jvel.get("head_pitch_joint", float("inf")),
+        ])
+
+    def head_settled(self, yaw: float, pitch: float,
+                     pos_tol: float = 0.03, vel_tol: float = 0.05) -> bool:
+        return joints_are_settled(
+            [yaw, pitch], self.head_meas(), self.head_vel(),
+            position_tolerance=pos_tol, velocity_tolerance=vel_tol)
+
     def gripper_meas(self, side: str) -> float:
         name = f"{'left' if side == 'left' else 'right'}_arm_eef_gripper_joint"
         base = 11 if side == "left" else 18
@@ -170,6 +209,15 @@ class MMK2Adapter(Node):
 
     def base_stopped(self) -> bool:
         return base_is_stopped(self.base_lin_meas, self.base_ang_meas)
+
+    def pose_at(self, stamp: float, max_dt: float = 0.10):
+        """Return the odom pose nearest a sensor timestamp."""
+        if not self.odom_history:
+            return None
+        sample = min(self.odom_history, key=lambda item: abs(item[0] - stamp))
+        if abs(sample[0] - stamp) > max_dt:
+            return None
+        return sample[1].copy(), float(sample[2])
 
     @property
     def rarm_meas(self) -> np.ndarray:

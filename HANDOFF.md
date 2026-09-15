@@ -49,54 +49,43 @@
 | `mmk2_adapter.py` | 19 维控制封装、发布 5 控制话题、odom/关节回读、平滑限幅；`MAX_LIN=0.08, MAX_ANG=0.18, BASE_GAIN_LIN=8, BASE_GAIN_ANG=4` |
 | `perception.py` | 9 类 YOLO + 深度→世界(MMK2FK) + ArUco + 近区过滤（`fwd 0.15–1.40, |lat|≤0.35, z 0.30–1.50`），发布 `/competition/product_detections`、`/competition/aruco_detections`、`/competition/result_image` |
 | `detector.py` | 9 类检测后端，权重 `weights/products9.pt`（mAP50≈0.99，22MB） |
-| `shelf_scanner.py` | 库存 kind→候选货位 |
-| `planner.py` | 全局栅格 + 360°雷达射线建图(footprint 过滤) + **按高度分档膨胀(高 0.45/低 0.25)** + 代价加权 A* + `_clear_path` |
+| `shelf_scanner.py` | 多帧库存 kind→候选货位，支持 reserve/release/consume |
+| `planner.py` | 全局栅格 + 实时 TF 外参的 360°雷达射线建图 + **按高度分档膨胀(高 0.45/低 0.35)** + 代价加权 A* |
 | `local_planner.py` | DWB（v,ω 采样 + 弧长推进/切向对齐/离障/只前进/防抖，`safety=0.05`） |
 | `competition_client.py` | 主状态机 + 写死原语 + 目标选择 |
 | `scripts/run_competition.sh` | 入口：perception + competition_client |
 | `tools/` | `gen_dataset_9cls.py` / `train_products9.py` |
 
 ### 状态机
-`WAIT_TASK, SCAN, ALIGN, NAV_SHELF, DEPLOY, CREEP, CLOSE, LIFT, RETREAT, RETURN, NAV_TABLE, PLACE, NEXT, DONE, ERROR`
-- **SCAN**：写死原语 `_build_scan_plan`：`goto(1.805,2.40)→scan→[左转90→西行0.885→右转90→scan]×4`（E→D→C→B→A）；头部 `yaw[-0.3,0,0.3]×pitch[-0.3,-0.7,-1.1]` 网格 + 自适应节拍；命中即停。
+`WAIT_TASK, STOW, SCAN, ALIGN, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE, LIFT, RETREAT, RETURN, NAV_TABLE, PLACE, NEXT, NAV_RETURN, DONE, ERROR`
+- **SCAN**：只访问未完成货架；头部实测稳定后执行 `yaw[-0.3,0,0.3]×pitch[-0.3,-0.7,-1.1]` 网格。仅稳定扫描窗口写库存，发现任一 pending kind 后立即预留并抓取；中断货架不会记完成。
 - **ALIGN**：两段——先 `_drive_to(lane)` 到位，再 `_turn_to(GRASP_YAW)` 对准 + 0.3s 稳定 → DEPLOY。
 - **DEPLOY/CREEP/CLOSE/LIFT/RETREAT**：官方抓取流程。
 - **RETURN**：取到后**写死**折线到 `OBSTACLE_ENTRY=(-0.50,2.475)`。
-- **NAV_TABLE**：`_navigate`(A*+DWB) 到 `TABLE_APPROACH=(-1.88,-2.80)`（**唯一用规划器的段**）。
+- **NAV_TABLE/NAV_RETURN**：随机障碍走廊双向使用实时 LaserScan + A* + DWB；货架区、出发区和抓取退让继续使用 odom 闭环固定原语。
 - **PLACE**：降 slide + 开爪。
+- **NEXT**：成功货位标记 consumed；优先复用已扫描库存，没有目标才返回继续扫描未知货架。
 
 ### 关键常量
-`YELLOW_MID_Y=2.475`、`GRASP_YAW=π/2−11°`、`APPROACH_DX=0.068`、`SHELF_X={A:-1.735,B:-0.850,C:0.035,D:0.920,E:1.805}`、`COLUMN_DX={C1:-0.22,C2:0,C3:0.22}`、`SCAN_Y=2.40`、`SHELF_STEP=0.885`、`EXPLORE_X0=1.805`、`EXPLORE_SPEED=0.06`、`EXPLORE_TURN_MAX=0.15`、`SCAN_SLIDE=0.11`、`HEAD_PITCH=-0.6`、`SLIDE_GRASP=0.11`、`CREEP_SPEED=0.08`、`RETREAT_SPEED=0.12`、`PLACE_LOWER_SLIDE=0.17`、`OBSTACLE_ENTRY=(-0.50,2.475)`、`TABLE_APPROACH=(-1.88,-2.80)`。
+`YELLOW_MID_Y=2.475`、`GRASP_YAW=π/2−11°`、`APPROACH_DX=0.068`、`SHELF_X={A:-1.735,B:-0.850,C:0.035,D:0.920,E:1.805}`、`COLUMN_DX={C1:-0.22,C2:0,C3:0.22}`、`SCAN_Y=2.40`、`EXPLORE_SPEED=0.06`、`EXPLORE_TURN_MAX=0.15`、`SCAN_SLIDE=0.11`、`HEAD_PITCH=-0.6`、`SLIDE_GRASP=0.11`、`RETREAT_SPEED=0.12`、`PLACE_LOWER_SLIDE=0.17`、`OBSTACLE_ENTRY=(-0.50,2.475)`、`TABLE_APPROACH=(-1.88,-2.80)`。
 
-## 5. 最近改动（**部分未提交**）
-已提交：DWB、两层膨胀、脱困背离障碍、任务解析、ArUco、9 类模型等（最新 `e3ccb4a`）。
-**未提交本地改动**：
-1. `perception.py`：`NEAR_LAT_MAX 0.80→0.35`（减少邻架斜视角误检）。
-2. `competition_client.py`：
-   - `EXPLORE_X0 1.70→1.805`（首扫对准货架 E 中心）。
-   - `_select_target` 改**当前货架优先**（按 `|shelf_x−base_x|` 降权）。
-   - **ALIGN 拆两段**（`pos→yaw` + 0.3s 稳定）。
-   - `_turn_to` 增益 0.8→0.5。
-   - 新增 `RETURN` + `OBSTACLE_ENTRY`；`ALIGN/RETURN` 加入 `phase_timeouts`。
-   - 探索原语去掉 `front_clear`（取货区不避障）。
+## 5. 当前实现
+1. 任务 ID 只保留为订单身份，不解析后缀，也不推导货架/层/列。
+2. YOLO 决定商品 kind；ArUco 只映射固定货位。同一 RGB 帧完成关联，并拒绝几何不一致、过远或歧义 marker。
+3. 库存按货位融合多帧类别和世界坐标，抓取前 reserve，失败 release，配送成功 consume。
+4. LaserScan 超过 0.5 秒、odom/JointState 超过 0.75 秒或 scan 找不到 0.1 秒内对应 odom 时立即停车。
+5. 规划路径被新障碍占用时立即重规划；删除未经验证的直接倒车脱困。
 
-## 6. 已知问题（均已改，**待验证**）
-1. 首轮先跑“右二”货架 D：横向过滤太宽 + 全局置信度选择 → 已改。
-2. ALIGN 卡死/乱转：`drive_to and turn_to` 同拍互扰 → 已改两段式。
-3. 取到后切回规划器又脱困：`RETREAT→NAV_TABLE` 直接进 A*/DWB → 已加 `RETURN`。
-4. 起步偏右、右臂贴东墙 → `EXPLORE_X0` 已移 1.805。
-5. IK 偶发失败（停偏/朝向）→ 先到位再对准，**后续用 ArUco 微调**。
-6. 未验证：随机场景（45 商品 + 5 障碍 + 多订单）。
+## 6. 已知限制
+1. 官方裁判按匿名 body ID 计分，但相机只提供商品类别、ArUco 只提供货位。若任务仅指定多个同类商品中的某一个实体，在不通过 ID 推导随机货位的约束下不可观测；默认全场任务或按类别选择全部该类商品不受影响。
+2. 固定场景联调确认移动/转向期间不再污染库存；尚未完成一次随机五订单端到端回归。
+3. 当前固定场景未看到 ArUco 检测，需继续验证 marker 可见角度和尺寸参数。
+4. IK 和机械臂到位时间仍需在完整抓取循环中调参。
 
 ## 7. 下一步计划
-已确认：
-- **A** 验证第 5/6 节修复（固定场景单跑）。
-- **B** 抓取前 **ArUco 微调**（读 `/competition/aruco_detections`，ID→货架/层/列固定），对准列中心与朝向再 DEPLOY。
-- **C** 闭环原语加“死区 + 到位稳定”（转向 2–3°、直行 3–5cm，每段停 0.3s）。
-
-可选：
-- **D** 黑箱自动调参（类 RL）：基准“转 90° + 直行 1m”，cost=误差+超调+时间+振荡；随机/网格→CMA-ES/贝叶斯，**只调客户端参数**（Server 轮速 PID 不可改）。
-- **E** 随机场景回归：`SUPERMARKET_RANDOMIZE=1 RANDOMIZE_OBSTACLES=1 SEED=11 TASKS=all`。
+- 随机场景 `SEED=11 TASKS=all` 验证双向走廊 A*/DWB、动态重规划和断流停车。
+- 完成至少一次“扫描中断→抓取配送→复用库存/续扫原货架”的多订单回归。
+- 验证 ArUco 可见率后再调整抓取微调和机械臂分组速度。
 
 ## 8. 常用命令
 ### 启动 Server（固定 Baseline）
@@ -145,6 +134,5 @@ sudo docker exec supermarket_sorting_client bash -lc 'source /opt/ros/humble/set
 - 资料：`/home/makabaka/文档/xwechat_files/wxid_ipka03tcmvxu22_e3be/msg/file/2026-09/`
 
 ## 10. 未决问题
-1. 自动裁判口径：抓到**任意一件该 kind** 即算，还是**必须指定匿名 body**？
-2. 提交形式：是否允许自建镜像，还是严格官方 Client 仅挂载代码？
-3. 随机场景回程（配送台→货架区）是否需避障（会穿走廊）。
+1. 主办方是否保证任务按 kind 覆盖该类全部实体；否则匿名 body 子集任务无法仅靠现有视觉区分。
+2. 提交形式是否允许自建镜像，还是严格官方 Client 仅挂载代码。

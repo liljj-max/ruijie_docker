@@ -26,8 +26,6 @@ from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from std_msgs.msg import String
 
-from kinematics.mmk2_fk import MMK2FK
-
 try:
     from competition_client.detector import ProductDetector, DEFAULT_WEIGHTS
 except Exception:  # allow running from inside the package dir
@@ -36,6 +34,8 @@ except Exception:  # allow running from inside the package dir
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
 MARKER_SIZE_M = 0.03
 VALID_ARUCO_IDS = set(range(45))
+ASSOCIATION_MAX_DIST_M = 0.22
+ASSOCIATION_MIN_MARGIN_M = 0.03
 
 # Only trust detections in the near frontal region of the base.  This drops far
 # items that would otherwise be mis-associated to the wrong shelf.
@@ -81,16 +81,32 @@ def slot_from_world(p) -> Optional[Dict]:
     return {"shelf": shelf, "level": level, "column": col}
 
 
+def validated_aruco_anchors(arucos):
+    """Return markers whose configured slot agrees with world quantization."""
+    anchors = []
+    for marker in arucos:
+        slot = aruco_id_to_slot(marker["id"])
+        measured = slot_from_world(marker["world"])
+        measured_slot = ((measured["shelf"], measured["level"], measured["column"])
+                         if measured is not None else None)
+        if slot is not None and measured_slot == slot:
+            anchors.append((slot, np.asarray(marker["world"], dtype=float), marker["id"]))
+    return anchors
+
+
 class PerceptionNode(Node):
     def __init__(self, detector=None, weights=DEFAULT_WEIGHTS,
                  confidence: float = 0.35, device: str = "auto",
                  enable_aruco: bool = True):
         super().__init__("competition_perception")
+        from kinematics.mmk2_fk import MMK2FK
+
         self.bridge = CvBridge()
         self.fk = MMK2FK()
         self.enable_aruco = enable_aruco
 
         self.K: Optional[np.ndarray] = None
+        self.D: Optional[np.ndarray] = None
         self._depth_msg: Optional[Image] = None
         self.base_pos = None
         self.base_quat = None
@@ -126,6 +142,7 @@ class PerceptionNode(Node):
     # ---- callbacks ----
     def _info_cb(self, msg: CameraInfo):
         self.K = np.asarray(msg.k, dtype=float).reshape(3, 3)
+        self.D = np.asarray(msg.d, dtype=float)
 
     def _depth_cb(self, msg: Image):
         self._depth_msg = msg
@@ -156,9 +173,10 @@ class PerceptionNode(Node):
         return T
 
     def pixel_to_cam(self, u, v, depth_m):
-        fx, fy = self.K[0, 0], self.K[1, 1]
-        cx, cy = self.K[0, 2], self.K[1, 2]
-        return np.array([(u - cx) * depth_m / fx, (v - cy) * depth_m / fy, depth_m])
+        pixel = np.array([[[float(u), float(v)]]], dtype=np.float64)
+        distortion = self.D if self.D is not None and self.D.size else None
+        normalized = cv2.undistortPoints(pixel, self.K, distortion).reshape(2)
+        return np.array([normalized[0] * depth_m, normalized[1] * depth_m, depth_m])
 
     @staticmethod
     def patch_depth_m(depth_img, u, v, r=4):
@@ -187,13 +205,10 @@ class PerceptionNode(Node):
 
         arucos = self._detect_aruco(rgb, T_cw) if self.enable_aruco else []
         arucos = [a for a in arucos if self._in_near_region(a["world"])]
-        anchors = []
-        for a in arucos:
-            slot = aruco_id_to_slot(a["id"])
-            if slot is not None:
-                anchors.append((slot, np.asarray(a["world"], dtype=float), a["id"]))
+        anchors = validated_aruco_anchors(arucos)
 
         products = []
+        used_marker_ids = set()
         for d in self.detector.detect(rgb):
             depth_m = self.patch_depth_m(depth, d["x"], d["y"])
             if depth_m <= 0.0:
@@ -202,7 +217,10 @@ class PerceptionNode(Node):
             p_world = (T_cw @ np.array([p_cam[0], p_cam[1], p_cam[2], 1.0]))[:3]
             if not self._in_near_region(p_world):
                 continue
-            slot, aruco_id, source = self._associate(p_world, anchors)
+            slot, aruco_id, source = self._associate(
+                p_world, anchors, used_marker_ids=used_marker_ids)
+            if aruco_id is not None:
+                used_marker_ids.add(aruco_id)
             products.append({
                 "kind": d["kind"], "conf": float(d["conf"]),
                 "world": [float(x) for x in p_world],
@@ -238,15 +256,23 @@ class PerceptionNode(Node):
                 and NEAR_Z_MIN <= z <= NEAR_Z_MAX)
 
     @staticmethod
-    def _associate(p_world, anchors, max_dist: float = 0.22):
-        """Anchor a product to the nearest ArUco slot, else fall back to geometry."""
-        best = None
+    def _associate(p_world, anchors, used_marker_ids=None,
+                   max_dist: float = ASSOCIATION_MAX_DIST_M,
+                   min_margin: float = ASSOCIATION_MIN_MARGIN_M):
+        """Associate only an unambiguous, unused marker; otherwise use geometry."""
         p = np.asarray(p_world, dtype=float)
+        candidates = []
         for slot, aw, aid in anchors:
             dist = float(np.linalg.norm(p - aw))
-            if dist <= max_dist and (best is None or dist < best[0]):
-                best = (dist, slot, aid)
-        if best is not None:
+            candidates.append((dist, slot, aid))
+        candidates.sort(key=lambda item: item[0])
+
+        best = candidates[0] if candidates else None
+        ambiguous = (len(candidates) > 1
+                     and candidates[1][0] - candidates[0][0] < min_margin)
+        used_marker_ids = used_marker_ids or set()
+        if (best is not None and best[0] < max_dist and not ambiguous
+                and best[2] not in used_marker_ids):
             return best[1], best[2], "aruco"
         s = slot_from_world(p_world)
         if s is not None:
@@ -266,9 +292,10 @@ class PerceptionNode(Node):
             half = MARKER_SIZE_M * 0.5
             obj = np.array([[-half, half, 0], [half, half, 0],
                             [half, -half, 0], [-half, -half, 0]], dtype=np.float32)
+            distortion = self.D if self.D is not None and self.D.size else None
             ok, rvec, tvec = cv2.solvePnP(
                 obj, np.asarray(marker_corners, dtype=np.float32).reshape(4, 2),
-                self.K, np.zeros(5), flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                self.K, distortion, flags=cv2.SOLVEPNP_IPPE_SQUARE)
             if not ok:
                 continue
             tvec = tvec.reshape(3)

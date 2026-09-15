@@ -29,8 +29,10 @@ import numpy as np
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+from tf2_ros import Buffer, TransformListener
 
 from competition_client.controller import PurePursuit
 from competition_client.grasp_logic import StableTargetTracker, creep_speed
@@ -47,29 +49,6 @@ DELIVERY_YAW = -math.pi / 2.0
 APPROACH_DX = 0.068          # base sits this far east of the target column
 SHELF_X = {"A": -1.735, "B": -0.850, "C": 0.035, "D": 0.920, "E": 1.805}
 COLUMN_DX = {"C1": -0.220, "C2": 0.0, "C3": 0.220}
-# The server names each body ``item_<run_prefix>_NN`` with a 1-based index over
-# the layout file order (A/L1/C1 ... E/L3/C3).  That index is the only way to
-# disambiguate multiple products of the same kind, so we reproduce the order to
-# recover the shelf slot of a specific task target.
-_SHELF_ORDER = ("A", "B", "C", "D", "E")
-_LEVEL_ORDER = ("L1", "L2", "L3")
-_COLUMN_ORDER = ("C1", "C2", "C3")
-LAYOUT_ORDER = [(s, l, c) for s in _SHELF_ORDER
-                for l in _LEVEL_ORDER for c in _COLUMN_ORDER]
-
-
-def slot_from_target_id(tid: str):
-    """Recover (shelf, level, column) from an anonymous ``item_..._NN`` id.
-
-    Returns ``None`` when the id does not follow the server's naming scheme.
-    """
-    try:
-        idx = int(str(tid).rsplit("_", 1)[1])
-    except (IndexError, ValueError):
-        return None
-    if 1 <= idx <= len(LAYOUT_ORDER):
-        return LAYOUT_ORDER[idx - 1]
-    return None
 SCAN_Y = 2.40                # observation lane in front of the shelves (safer)
 SCAN_SLIDE = 0.11            # raise the head to shelf level while scanning
 SCAN_YAWS = [-0.30, 0.0, 0.30]          # head_yaw sweep (within +-0.5 limit)
@@ -95,22 +74,20 @@ SCAN_DWELL_MAX = 2.0      # extend while new detections keep arriving
 SCAN_SETTLE = 0.8
 
 # hard-coded exploration primitives (departure + shelf zone)
-SHELF_STEP = 0.885        # x spacing between shelf observation points
-EXPLORE_X0 = 1.805        # start-x of the north leg (shelf E centre)
 EXPLORE_SPEED = 0.06
 EXPLORE_DRIVE_TOL = 0.06
 EXPLORE_TURN_TOL = 0.03
 EXPLORE_TURN_MAX = 0.15
 
 # phases
-(WAIT_TASK, SCAN, ALIGN, NAV_SHELF, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE,
- LIFT, RETREAT, RETURN, NAV_TABLE, PLACE, NEXT, DONE, ERROR) = range(17)
+(WAIT_TASK, STOW, SCAN, ALIGN, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE, LIFT,
+ RETREAT, RETURN, NAV_TABLE, PLACE, NEXT, NAV_RETURN, DONE, ERROR) = range(18)
 PHASE_NAME = {
-    WAIT_TASK: "wait-task", SCAN: "scan", ALIGN: "align", NAV_SHELF: "nav->shelf",
+    WAIT_TASK: "wait-task", STOW: "stow", SCAN: "scan", ALIGN: "align",
     DEPLOY: "deploy", WAIT_ARM: "wait-arm", CREEP: "creep", BRAKE: "brake",
     CLOSE: "close", LIFT: "lift",
     RETREAT: "retreat", RETURN: "return", NAV_TABLE: "nav->table", PLACE: "place",
-    NEXT: "next", DONE: "done", ERROR: "error",
+    NEXT: "next", NAV_RETURN: "nav->shelf-zone", DONE: "done", ERROR: "error",
 }
 
 
@@ -123,35 +100,47 @@ class CompetitionClient(Node):
         self.task_listener = TaskListener(on_new_task=self._on_new_task)
 
         self.products = []
+        self.products_seq = 0
         self.aruco = []
         self.scan_ranges = None
         self.scan_angle_min = 0.0
         self.scan_angle_inc = 0.0
+        self.scan_range_min = 0.02
+        self.scan_range_max = 12.0
+        self.scan_frame = "laser"
+        self.scan_rx_t = 0.0
+        self.scan_stamp = 0.0
+        self.scan_time = Time()
+        self.scan_seq = 0
+        self.mapped_scan_seq = -1
 
         self.phase = WAIT_TASK
         self.state_t0 = self._now()
         self.target = None            # SlotRecord being attempted
+        self.target_order = None      # exact TaskTarget; id is identity only
         self.target_kind = None
-        self.pending = []             # remaining task kinds (removed on delivery)
-        self.prefer_slots = {}        # slot -> kind, from specific task ids
+        self.pending = []             # remaining TaskTarget objects
         self.failed_slots = set()     # slots that failed this run
         self.phase_timeouts = {
-            ALIGN: 40.0, RETURN: 30.0, NAV_SHELF: 90.0, DEPLOY: 20.0,
+            STOW: 15.0, ALIGN: 40.0, RETURN: 30.0, NAV_RETURN: 90.0,
+            DEPLOY: 20.0,
             WAIT_ARM: 10.0, CREEP: 30.0, BRAKE: 3.0, CLOSE: 4.0,
-            NAV_TABLE: 90.0, PLACE: 20.0,
+            LIFT: 10.0, RETREAT: 20.0, NAV_TABLE: 90.0, PLACE: 20.0,
         }
-        self.scan_idx = 0
         self.scan_yaw_idx = 0
         self.scan_pitch_idx = 0
-        self.scan_route_set = False
-        self.scan_order = None
         self.view_t0 = 0.0
         self.view_start = 0.0
+        self.view_settle_t0 = 0.0
+        self.view_products_seq = -1
         self.view_inv = 0
         self.align_stage = "pos"
         self.align_settle_t0 = 0.0
         self.explore_plan = None
         self.explore_i = 0
+        self.scan_complete = False
+        self.scan_views = 0
+        self.scanned_shelves = set()
         self.prim_start_xy = None
         self.prim_start_yaw = 0.0
         self.nav_idx = 0
@@ -163,6 +152,7 @@ class CompetitionClient(Node):
         self.deploy_world = None
         self.grasp_world = None
         self.motion_settle_t0 = 0.0
+        self.stow_next = SCAN
         self.last_log = 0.0
         self.last_dbg = 0.0
         self.debug = os.environ.get("COMP_DEBUG", "") == "1"
@@ -187,6 +177,9 @@ class CompetitionClient(Node):
         self.path = None
         self.path_goal = None
         self.replan_t = 0.0
+        self.last_sensor_warn = 0.0
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.create_subscription(String, "/competition/product_detections",
                                  self._products_cb, 10)
@@ -203,37 +196,58 @@ class CompetitionClient(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     def _on_new_task(self, task):
+        holding = self.phase in (LIFT, RETREAT, RETURN, NAV_TABLE, PLACE)
+        if holding and self.adapter.gripper_meas("right") < 0.5:
+            self.adapter.stop_base()
+            self.get_logger().error(
+                "new run received while carrying an item; stopping without opening gripper")
+            self._enter(ERROR)
+            return
         self.task = task
+        self.adapter.stop_base()
         self.inventory.reset()
-        self.pending = [t.kind for t in task.targets]
-        self.scan_idx = 0
+        self.pending = list(task.targets)
+        self.failed_slots.clear()
+        self.products = []
+        self.aruco = []
+        self.target = None
+        self.target_order = None
+        self.target_kind = None
+        self.target_locked = False
+        self.deploy_world = None
+        self.grasp_world = None
         self.scan_yaw_idx = 0
         self.scan_pitch_idx = 0
-        self.scan_route_set = False
-        self.scan_order = None
         self.explore_plan = None
         self.explore_i = 0
+        self.scan_complete = False
+        self.scan_views = 0
+        self.scanned_shelves = set()
         self.prim_start_xy = None
         self.target_tracker.clear()
-        # Recover exact slots for specific-body targets (skip on the all-items
-        # run, where the layout is shuffled and every product is a valid target).
-        self.prefer_slots = {}
-        if task.count < len(LAYOUT_ORDER):
-            for t in task.targets:
-                slot = slot_from_target_id(t.id)
-                if slot is not None:
-                    self.prefer_slots[slot] = t.kind
-        self.get_logger().info(f"new task run={task.run_prefix} kinds={self.pending}")
-        if self.prefer_slots:
-            self.get_logger().info(f"preferred slots: {self.prefer_slots}")
-        self._enter(SCAN)
+        self.path = None
+        self.path_goal = None
+        kinds = [t.kind for t in self.pending]
+        self.get_logger().info(f"new task run={task.run_prefix} kinds={kinds}")
+        self.stow_next = SCAN
+        self._enter(STOW)
 
     def _products_cb(self, msg):
         try:
             self.products = json.loads(msg.data)
         except Exception:  # noqa: BLE001
             self.products = []
-        self.inventory.update(self.products, self.aruco)
+        self.products_seq += 1
+        scanning_view = (
+            self.phase == SCAN
+            and self.explore_plan is not None
+            and self.explore_i < len(self.explore_plan)
+            and self.explore_plan[self.explore_i][0] == "scan"
+            and self.view_settle_t0 > 0.0
+            and self._now() - self.view_settle_t0 >= SCAN_SETTLE
+        )
+        if scanning_view:
+            self.inventory.update(self.products)
         if self.debug and self._now() - self.last_dbg > 2.0:
             self.last_dbg = self._now()
             sample = [(p["kind"], p.get("slot"), p.get("slot_source"),
@@ -252,6 +266,15 @@ class CompetitionClient(Node):
         self.scan_ranges = np.asarray(msg.ranges, dtype=float)
         self.scan_angle_min = float(msg.angle_min)
         self.scan_angle_inc = float(msg.angle_increment)
+        self.scan_range_min = float(msg.range_min)
+        self.scan_range_max = float(msg.range_max)
+        self.scan_frame = msg.header.frame_id.lstrip("/") or "laser"
+        self.scan_rx_t = self._now()
+        self.scan_stamp = float(msg.header.stamp.sec) + msg.header.stamp.nanosec * 1e-9
+        if self.scan_stamp <= 0.0:
+            self.scan_stamp = self.scan_rx_t
+        self.scan_time = Time.from_msg(msg.header.stamp)
+        self.scan_seq += 1
 
     def _enter(self, phase):
         self.phase = phase
@@ -307,6 +330,36 @@ class CompetitionClient(Node):
         return 0.25
 
     # ---- grid-planner navigation ----
+    def _laser_pose_in_base(self):
+        """Return live base_link->laser planar TF, or None when unavailable."""
+        if self.scan_frame == "base_link":
+            return 0.0, 0.0, 0.0
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "base_link", self.scan_frame, self.scan_time)
+        except Exception as exc:  # noqa: BLE001
+            if self._now() - self.last_sensor_warn > 2.0:
+                self.last_sensor_warn = self._now()
+                self.get_logger().warn(
+                    f"missing base_link->{self.scan_frame} TF: {exc}")
+            return None
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return float(t.x), float(t.y), float(yaw)
+
+    def _planned_path_invalid(self) -> bool:
+        if self.path is None or self.adapter.base_xy is None:
+            return False
+        points = self._path_ahead(self.adapter.base_xy, self.path, 0.10, 1.00)
+        for x, y in points:
+            i, j = self.planner.world_to_idx(float(x), float(y))
+            if (not (0 <= i < self.planner.nx and 0 <= j < self.planner.ny)
+                    or self.planner.blocked[i, j]):
+                return True
+        return False
+
     def _navigate(self, goal, final_yaw=None, tol: float = 0.15) -> bool:
         """Plan an A* path to ``goal`` and follow it.  Returns True when reached.
 
@@ -319,33 +372,56 @@ class CompetitionClient(Node):
             self.path = None
             self.path_goal = goal
             self.dwb.reset()
-        if self.scan_ranges is not None:
+        if self.scan_ranges is None or now - self.scan_rx_t > 0.50:
+            a.stop_base()
+            self.path = None
+            if now - self.last_sensor_warn > 2.0:
+                self.last_sensor_warn = now
+                self.get_logger().warn("LaserScan missing or stale; navigation stopped")
+            return False
+        if self.mapped_scan_seq != self.scan_seq:
+            sensor_pose = self._laser_pose_in_base()
+            odom_pose = self.adapter.pose_at(self.scan_stamp)
+            if sensor_pose is None or odom_pose is None:
+                a.stop_base()
+                self.path = None
+                if odom_pose is None and now - self.last_sensor_warn > 2.0:
+                    self.last_sensor_warn = now
+                    self.get_logger().warn("LaserScan has no time-aligned odom pose")
+                return False
+            scan_xy, scan_yaw = odom_pose
             self.planner.update_scan(
                 self.scan_ranges, self.scan_angle_min, self.scan_angle_inc,
-                float(a.base_xy[0]), float(a.base_xy[1]), float(a.base_yaw))
-        if self.path is None or now - self.replan_t > 1.5:
+                float(scan_xy[0]), float(scan_xy[1]), float(scan_yaw),
+                sensor_pose=sensor_pose,
+                range_min=self.scan_range_min, range_max=self.scan_range_max)
+            self.mapped_scan_seq = self.scan_seq
+            if self._planned_path_invalid():
+                self.get_logger().info("planned path blocked; replanning")
+                self.path = None
+                self.replan_t = 0.0
+        if self.path is None or now - self.replan_t > 1.0:
             self.replan_t = now
             self.path = self.planner.plan(
                 (float(a.base_xy[0]), float(a.base_xy[1])), goal)
             if self.path is not None:
+                if math.hypot(self.path[-1][0] - goal[0],
+                              self.path[-1][1] - goal[1]) > 0.25:
+                    self.get_logger().warn("planner moved goal too far; stopping")
+                    self.path = None
+                    a.stop_base()
+                    return False
                 self.get_logger().info(
                     f"planned {len(self.path)} pts -> {np.round(goal, 2)}")
 
-        # stuck recovery: drive away from the nearest obstacle, then replan
-        if now < self.recover_until:
-            self._command_escape(0.12)
-            return False
-
-        # hard safety: never push further if the base centre is inside the
-        # inflated obstacles (e.g. drifted into the shelf); back out and replan
+        # Never issue an unvalidated escape command inside the safety buffer.
         ci, cj = self.planner.world_to_idx(float(a.base_xy[0]), float(a.base_xy[1]))
         if (0 <= ci < self.planner.nx and 0 <= cj < self.planner.ny
                 and float(self.planner.margin[ci, cj]) < 0.02):
-            self.get_logger().warn("base inside safety buffer; escaping")
-            self._command_escape(0.12)
+            self.get_logger().warn("base inside safety buffer; stopping and replanning")
+            a.stop_base()
             self.path = None
             self.replan_t = 0.0
-            self.recover_until = self._now() + 1.5
             return False
 
         if self.path is None:
@@ -376,7 +452,7 @@ class CompetitionClient(Node):
                 self.path = None
                 return True
             ang = 0.6 * yaw_err - 0.4 * yaw_rate
-            ang = max(-0.30, min(0.30, ang))
+            ang = max(-0.18, min(0.18, ang))
             a.set_base_velocity(0.0, ang)
             return False
 
@@ -523,27 +599,11 @@ class CompetitionClient(Node):
 
     # ---- target selection ----
     def _select_target(self):
-        """Pick the best pending candidate.
-
-        When the task names specific bodies we must grab exactly those slots:
-        a same-kind look-alike on another shelf would score nothing (and its
-        displacement is penalised), so we keep scanning until the preferred
-        slot is observed.  Otherwise fall back to nearest-shelf preference.
-        """
+        """Reserve the best visually observed candidate for a pending order."""
         bx = float(self.adapter.base_xy[0]) if self.adapter.base_xy is not None else None
-        if self.prefer_slots:
-            for kind in list(self.pending):
-                for c in self.inventory.candidates(kind):
-                    if c.slot in self.failed_slots:
-                        continue
-                    if self.prefer_slots.get(c.slot) == kind:
-                        self.target = c
-                        self.target_kind = kind
-                        return True
-            return False
         best = None
-        for kind in list(self.pending):
-            for c in self.inventory.candidates(kind):
+        for order in self.pending:
+            for c in self.inventory.candidates(order.kind):
                 if c.slot in self.failed_slots:
                     continue
                 score = c.confidence
@@ -552,11 +612,14 @@ class CompetitionClient(Node):
                     if sx is not None:
                         score -= 0.5 * abs(sx - bx)   # prefer the current shelf
                 if best is None or score > best[0]:
-                    best = (score, c, kind)
+                    best = (score, c, order)
         if best is None:
             return False
+        if not self.inventory.reserve(best[1].slot):
+            return False
         self.target = best[1]
-        self.target_kind = best[2]
+        self.target_order = best[2]
+        self.target_kind = best[2].kind
         return True
 
     def _approach_lane(self):
@@ -568,18 +631,11 @@ class CompetitionClient(Node):
         """World goal for the current navigation phase (for progress checks)."""
         if self.phase == SCAN:
             return None  # primitive-driven; no progress check needed
-        if self.phase == NAV_SHELF and self.target is not None:
-            return tuple(self._approach_lane())
         if self.phase == NAV_TABLE:
             return tuple(TABLE_APPROACH)
+        if self.phase == NAV_RETURN:
+            return tuple(OBSTACLE_ENTRY)
         return None
-
-    def _ensure_scan_order(self):
-        """Order the shelves nearest-first from the current position."""
-        if self.scan_order is not None or self.adapter.base_xy is None:
-            return
-        self.scan_order = sorted(
-            SHELF_X, key=lambda s: abs(SHELF_X[s] - float(self.adapter.base_xy[0])))
 
     # ---- perception lock during DEPLOY ----
     def _lock_from_products(self):
@@ -606,6 +662,7 @@ class CompetitionClient(Node):
     def tick(self):
         a = self.adapter
         if not a.ready:
+            a.emergency_stop()
             return
 
         to = self.phase_timeouts.get(self.phase)
@@ -615,7 +672,7 @@ class CompetitionClient(Node):
             self._log()
             return
 
-        if self.phase in (SCAN, NAV_SHELF, NAV_TABLE) and a.base_xy is not None:
+        if self.phase in (SCAN, NAV_TABLE, NAV_RETURN) and a.base_xy is not None:
             goal = self._current_goal()
             if goal is not None:
                 if self.stuck_goal != goal:
@@ -633,15 +690,39 @@ class CompetitionClient(Node):
                 elif self._now() - self.stuck_t0 > 6.0:
                     self.get_logger().warn(
                         f"stuck (no progress toward {np.round(goal, 2)}, d={d:.2f}); "
-                        f"backing out + replan")
+                        f"stopping + replan")
                     self.path = None
                     self.replan_t = 0.0
-                    self.recover_until = self._now() + 3.0
+                    a.stop_base()
                     self.stuck_best_d = d
                     self.stuck_t0 = self._now()
 
         if self.phase == WAIT_TASK:
             a.stop_base()
+        elif self.phase == STOW:
+            a.stop_base()
+            a.home()
+            settled = (a.arm_settled("right", pos_tol=0.08, vel_tol=0.10)
+                       and abs(a.slide_meas) < 0.03
+                       and a.gripper_settled("right", GRIP_OPEN,
+                                             pos_tol=0.08, vel_tol=0.10))
+            if settled:
+                if self.motion_settle_t0 == 0.0:
+                    self.motion_settle_t0 = self._now()
+                elif self._now() - self.motion_settle_t0 >= 0.3:
+                    self.motion_settle_t0 = 0.0
+                    if self.stow_next == SCAN:
+                        self._enter(SCAN)
+                    elif self.stow_next == NAV_RETURN:
+                        self.path = None
+                        self.path_goal = None
+                        self._enter(NAV_RETURN)
+                    elif self.stow_next == ALIGN:
+                        self._start_nav_shelf()
+                    else:
+                        self._enter(self.stow_next)
+            else:
+                self.motion_settle_t0 = 0.0
         elif self.phase == SCAN:
             self._tick_scan()
         elif self.phase == ALIGN:
@@ -660,11 +741,6 @@ class CompetitionClient(Node):
                         self._enter(DEPLOY)
                 else:
                     self.align_settle_t0 = 0.0
-        elif self.phase == NAV_SHELF:
-            if self._navigate(self._approach_lane(), GRASP_YAW, tol=0.06):
-                self.target_tracker.clear()
-                self.target_locked = False
-                self._enter(DEPLOY)
         elif self.phase == DEPLOY:
             a.stop_base()
             a.set_head(0.0, HEAD_PITCH)
@@ -684,7 +760,7 @@ class CompetitionClient(Node):
                         self.target_tracker.clear()
         elif self.phase == WAIT_ARM:
             a.stop_base()
-            if a.arm_settled("right"):
+            if a.arm_settled("right", pos_tol=0.06, vel_tol=0.08):
                 if self.motion_settle_t0 == 0.0:
                     self.motion_settle_t0 = self._now()
                 elif self._now() - self.motion_settle_t0 >= 0.3:
@@ -754,13 +830,34 @@ class CompetitionClient(Node):
                 if self._now() - self.state_t0 > 1.0:
                     self._enter(NEXT)
         elif self.phase == NEXT:
-            if self.target_kind in self.pending:
-                self.pending.remove(self.target_kind)
+            if self.target is not None:
+                self.inventory.consume(self.target.slot)
+            if self.target_order in self.pending:
+                self.pending.remove(self.target_order)
             self.target = None
+            self.target_order = None
             self.target_kind = None
             self.target_locked = False
             self.target_tracker.clear()
-            self._recover()
+            if not self.pending:
+                self.stow_next = DONE
+            elif self._select_target():
+                self.stow_next = NAV_RETURN
+            else:
+                self.explore_plan = None
+                self.explore_i = 0
+                self.stow_next = NAV_RETURN
+            self._enter(STOW)
+        elif self.phase == NAV_RETURN:
+            if self._navigate(OBSTACLE_ENTRY, final_yaw=None, tol=0.15):
+                self.path = None
+                self.path_goal = None
+                if self.target is not None:
+                    self._start_nav_shelf()
+                else:
+                    self.explore_plan = None
+                    self.explore_i = 0
+                    self._enter(SCAN)
         elif self.phase == DONE:
             a.stop_base()
         else:
@@ -770,19 +867,30 @@ class CompetitionClient(Node):
         self._log()
 
     def _build_scan_plan(self):
-        """Hard-coded departure + shelf exploration plan.
-
-        north -> scan -> [left 90 -> west SHELF_STEP -> right 90 -> scan] x (n-1)
-        """
-        plan = [("goto", (EXPLORE_X0, SCAN_Y)), ("scan",)]
-        for _ in range(len(SHELF_X) - 1):
-            plan += [("turn", math.pi), ("drive", SHELF_STEP),
-                     ("turn", math.pi / 2.0), ("scan",)]
+        """Visit only shelves whose full camera sweep has not completed."""
+        shelves = [s for s in SHELF_X if s not in self.scanned_shelves]
+        if self.adapter.base_xy is not None:
+            bx = float(self.adapter.base_xy[0])
+            ordered = sorted(shelves, key=lambda s: SHELF_X[s])
+            nearest = min(range(len(ordered)), key=lambda i: abs(SHELF_X[ordered[i]] - bx))
+            left = list(reversed(ordered[:nearest]))
+            right = ordered[nearest + 1:]
+            if left and right and abs(SHELF_X[right[0]] - bx) < abs(SHELF_X[left[0]] - bx):
+                shelves = [ordered[nearest], *right, *left]
+            else:
+                shelves = [ordered[nearest], *left, *right]
+        plan = []
+        for shelf in shelves:
+            plan += [("goto", (SHELF_X[shelf], SCAN_Y)),
+                     ("turn", math.pi / 2.0), ("scan", shelf)]
         return plan
 
     def _prim_reset(self):
         self.prim_start_xy = None
         self.view_t0 = 0.0
+        self.view_start = 0.0
+        self.view_settle_t0 = 0.0
+        self.view_products_seq = -1
 
     def _drive_to(self, x, y):
         """Drive to a world point; turn in place first when badly misaligned."""
@@ -828,8 +936,23 @@ class CompetitionClient(Node):
         a = self.adapter
         a.stop_base()
         a.set_slide(SCAN_SLIDE)
-        a.set_head(SCAN_YAWS[self.scan_yaw_idx], SCAN_PITCHES[self.scan_pitch_idx])
+        yaw = SCAN_YAWS[self.scan_yaw_idx]
+        pitch = SCAN_PITCHES[self.scan_pitch_idx]
+        a.set_head(yaw, pitch)
         now = self._now()
+        if not a.head_settled(yaw, pitch):
+            self.view_settle_t0 = 0.0
+            self.view_t0 = 0.0
+            self.view_start = 0.0
+            return False
+        if self.view_settle_t0 == 0.0:
+            self.view_settle_t0 = now
+            self.view_products_seq = self.products_seq
+            return False
+        if now - self.view_settle_t0 < SCAN_SETTLE:
+            return False
+        if self.products_seq <= self.view_products_seq:
+            return False
         if self.view_t0 == 0.0:
             self.view_t0 = now
             self.view_start = now
@@ -843,6 +966,10 @@ class CompetitionClient(Node):
             return False
         self.scan_pitch_idx += 1
         self.view_t0 = 0.0
+        self.view_start = 0.0
+        self.view_settle_t0 = 0.0
+        self.view_products_seq = -1
+        self.scan_views += 1
         if self.scan_pitch_idx >= len(SCAN_PITCHES):
             self.scan_pitch_idx = 0
             self.scan_yaw_idx += 1
@@ -853,10 +980,9 @@ class CompetitionClient(Node):
 
     def _tick_scan(self):
         a = self.adapter
-        # if a pending target is already known, go straight to it
-        if self._select_target():
-            self._start_nav_shelf()
-            return
+        # Orders are all known up front.  Stop searching as soon as any pending
+        # kind has a stable inventory candidate; completed shelf coverage and
+        # all earlier observations remain cached for subsequent orders.
         if a.base_xy is None:
             a.stop_base()
             return
@@ -866,17 +992,18 @@ class CompetitionClient(Node):
             self.scan_yaw_idx = 0
             self.scan_pitch_idx = 0
             self.get_logger().info(f"exploration plan: {self.explore_plan}")
+        if (self.explore_i < len(self.explore_plan)
+                and self.explore_plan[self.explore_i][0] == "scan"
+                and self._select_target()):
+            self._start_nav_shelf()
+            return
         if self.explore_i >= len(self.explore_plan):
-            if self.prefer_slots:
-                self.get_logger().warn(
-                    "preferred slot(s) not observed; falling back to kind scan")
-                self.prefer_slots = {}
-                self.explore_plan = None
-                self.explore_i = 0
-                self.scan_yaw_idx = 0
-                self.scan_pitch_idx = 0
-                self._prim_reset()
+            if self._select_target():
+                self._start_nav_shelf()
                 return
+            self.scan_complete = len(self.scanned_shelves) == len(SHELF_X)
+            self.get_logger().info(
+                f"scan coverage={sorted(self.scanned_shelves)} views={self.scan_views}")
             self._enter(ERROR if self.pending else DONE)
             return
         step = self.explore_plan[self.explore_i]
@@ -891,6 +1018,8 @@ class CompetitionClient(Node):
         else:
             done = self._do_scan()
         if done:
+            if kind == "scan" and arg is not None:
+                self.scanned_shelves.add(arg)
             self.explore_i += 1
             self._prim_reset()
 
@@ -911,31 +1040,41 @@ class CompetitionClient(Node):
             f"timeout in {PHASE_NAME[phase]} "
             f"target={self.target.slot if self.target else None}")
         self.adapter.stop_base()
-        if phase in (ALIGN, NAV_SHELF, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE):
+        if phase in (ALIGN, DEPLOY, WAIT_ARM, CREEP, BRAKE, CLOSE):
             self.adapter.home()
             if self.target is not None:
+                self.inventory.release(self.target.slot)
                 self.failed_slots.add(self.target.slot)
             self.target = None
+            self.target_order = None
+            self.target_kind = None
             self.target_locked = False
             self.target_tracker.clear()
             self._recover()
+        elif phase == NAV_RETURN:
+            if self.target is not None:
+                self.inventory.release(self.target.slot)
+            self.target = None
+            self.target_order = None
+            self.target_kind = None
+            self._enter(ERROR)
+        elif phase == STOW:
+            self._enter(ERROR)
         else:
             # holding or placing: do NOT home (avoid dropping); stop and finish
             self._enter(DONE)
 
     def _recover(self):
         if self.pending and self._select_target():
-            self._start_nav_shelf()
+            self.stow_next = ALIGN
+            self._enter(STOW)
+        elif self.pending and len(self.scanned_shelves) < len(SHELF_X):
+            self.explore_plan = None
+            self.explore_i = 0
+            self.stow_next = SCAN
+            self._enter(STOW)
         elif self.pending:
-            self.scan_idx = 0
-            self.scan_yaw_idx = 0
-            self.scan_pitch_idx = 0
-            self.scan_route_set = False
-            self.scan_order = None
-            self.view_t0 = 0.0
-            self.view_start = 0.0
-            self.view_inv = 0
-            self._enter(SCAN)
+            self._enter(ERROR)
         else:
             self._enter(DONE)
 
@@ -945,11 +1084,12 @@ class CompetitionClient(Node):
         self.last_log = self._now()
         a = self.adapter
         inv = self.inventory.summary()
+        pending = [f"{t.id}:{t.kind}" for t in self.pending]
         self.get_logger().info(
             f"phase={PHASE_NAME[self.phase]} base=({a.base_xy[0]:.2f},{a.base_xy[1]:.2f}) "
             f"yaw={a.base_yaw:.2f} cmd=({a.des_lin:.2f},{a.des_ang:.2f}) "
             f"front_clear={self._front_clear()} nav={self.nav_idx}/{len(self.route)}:{self.nav_mode} "
-            f"lock={self.target_tracker.sample_count} pending={self.pending} inv={inv}")
+            f"lock={self.target_tracker.sample_count} pending={pending} inv={inv}")
 
 
 def main():
@@ -971,7 +1111,8 @@ def main():
         executor.shutdown()
         for n in (client, client.adapter, client.task_listener):
             n.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
