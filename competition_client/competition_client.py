@@ -71,10 +71,13 @@ OBSTACLE_ENTRY = [-0.50, YELLOW_MID_Y]   # north of the corridor board; avoidanc
 
 # manipulation params (from the reference baseline)
 HEAD_PITCH = -0.6
-# The deploy pose must keep the target in the head camera's view, so the pitch
-# follows the target shelf level (mirrors SCAN_PITCHES).  A fixed -0.6 looked
-# past the L3 (top) row, so L3 targets were never detected and DEPLOY timed out.
-DEPLOY_HEAD_PITCH = {"L1": -1.00, "L2": -0.60, "L3": -0.30}
+# The deploy pose must keep the target in the head camera's view.  The scan
+# pitch per level was calibrated at SCAN_SLIDE, but the deploy uses a different
+# spine slide (grasp_slide), which raises/lowers the whole head by
+# (grasp_slide - SCAN_SLIDE) metres (spine z = 1.406 - q).  Compensate the
+# pitch by that height difference at ~0.77 m range.
+SCAN_PITCH_BY_LEVEL = {"L3": -0.30, "L2": -0.70, "L1": -1.10}
+DEPLOY_PITCH_K = 1.25
 # The scan looks at the shelf with the base at pi/2 and head yaw 0, but the
 # grasp approach turns the base to GRASP_YAW = pi/2 - 11 deg.  The deploy head
 # yaw must compensate, otherwise the (top-shelf) target drops out of the
@@ -82,8 +85,8 @@ DEPLOY_HEAD_PITCH = {"L1": -1.00, "L2": -0.60, "L3": -0.30}
 DEPLOY_HEAD_YAW = wrap_to_pi(math.pi / 2.0 - GRASP_YAW)
 # If the target is still not seen, sweep (dyaw, dpitch) around the level pitch
 # to re-acquire it before giving up.
-DEPLOY_LOOK = [(0.0, 0.0), (0.0, -0.15), (-0.20, 0.0), (0.20, 0.0),
-               (-0.20, -0.15), (0.20, -0.15)]
+DEPLOY_LOOK = [(0.0, 0.0), (0.0, 0.15), (0.0, -0.15),
+               (-0.20, 0.0), (0.20, 0.0)]
 DEPLOY_PITCH_DWELL = 1.5   # s to hold each look before trying the next
 SLIDE_GRASP = 0.11
 # The spine (slide) raises/lowers the chest, so the reachable height depends on
@@ -987,7 +990,9 @@ class CompetitionClient(Node):
         elif self.phase == DEPLOY:
             a.stop_base()
             level = self.target.slot[1] if self.target is not None else "L2"
-            base_pitch = DEPLOY_HEAD_PITCH.get(level, HEAD_PITCH)
+            grasp_slide = SLIDE_GRASP_BY_LEVEL.get(level, SLIDE_GRASP)
+            base_pitch = (SCAN_PITCH_BY_LEVEL.get(level, HEAD_PITCH)
+                          + DEPLOY_PITCH_K * (grasp_slide - SCAN_SLIDE))
             dyaw, dpitch = DEPLOY_LOOK[min(self.deploy_pitch_idx, len(DEPLOY_LOOK) - 1)]
             yaw = DEPLOY_HEAD_YAW + dyaw
             pitch = base_pitch + dpitch
