@@ -173,6 +173,8 @@ class CompetitionClient(Node):
         self.grasp_world = None
         self.motion_settle_t0 = 0.0
         self.grasp_slide = SLIDE_GRASP
+        self.stuck_move_t0 = 0.0
+        self.reverse_until = 0.0
         self.last_arm_dbg = 0.0
         self.last_nav_dbg = 0.0
         self.stow_next = SCAN
@@ -518,6 +520,8 @@ class CompetitionClient(Node):
         v, w, _ = self.dwb.compute(
             self.planner, (float(a.base_xy[0]), float(a.base_xy[1])),
             a.base_yaw, self.path, eff_goal)
+        if self._stall_recovery():
+            return False
         if self._now() - self.last_nav_dbg > 1.0:
             self.last_nav_dbg = self._now()
             self.get_logger().info(
@@ -640,6 +644,29 @@ class CompetitionClient(Node):
         vals = r[np.abs(rel) <= half]
         vals = vals[np.isfinite(vals) & (vals > 0.05)]
         return float(np.min(vals)) if vals.size else float("inf")
+
+    def _stall_recovery(self) -> bool:
+        """Detect a physically stalled base (commanded but not moving) and back
+        straight out for a moment.  Returns True while the recovery is active."""
+        a = self.adapter
+        moving = abs(a.base_lin_meas) > 0.005 or abs(a.base_ang_meas) > 0.02
+        commanded = abs(a.des_lin) > 0.03 or abs(a.des_ang) > 0.05
+        if commanded and not moving:
+            if self.stuck_move_t0 == 0.0:
+                self.stuck_move_t0 = self._now()
+            elif self._now() - self.stuck_move_t0 > 2.0:
+                self.reverse_until = self._now() + 1.5
+                self.stuck_move_t0 = 0.0
+                self.get_logger().warn("[nav] base stalled; reversing to free")
+        else:
+            self.stuck_move_t0 = 0.0
+        if self._now() < self.reverse_until:
+            if self._laser_min_in_dir(a.base_yaw + math.pi) > 0.20:
+                a.set_base_velocity(-0.08, 0.0)
+            else:
+                a.stop_base()
+            return True
+        return False
 
     def _escape_step(self, speed: float = 0.06) -> bool:
         """Validated recovery from the inflation buffer: drive away from the
@@ -791,6 +818,7 @@ class CompetitionClient(Node):
     # ---- main tick ----
     def tick(self):
         a = self.adapter
+        self._tick_t0 = self._now()
         if not a.ready:
             a.emergency_stop()
             return
@@ -1043,6 +1071,7 @@ class CompetitionClient(Node):
             a.stop_base()
 
         a.step()
+        self._tick_dt = self._now() - getattr(self, "_tick_t0", self._now())
         self._log()
 
     def _build_scan_plan(self):
@@ -1074,6 +1103,8 @@ class CompetitionClient(Node):
     def _drive_to(self, x, y):
         """Drive to a world point; turn in place first when badly misaligned."""
         a = self.adapter
+        if self._stall_recovery():
+            return False
         dx = x - float(a.base_xy[0])
         dy = y - float(a.base_xy[1])
         dist = math.hypot(dx, dy)
@@ -1271,6 +1302,8 @@ class CompetitionClient(Node):
         self.get_logger().info(
             f"phase={PHASE_NAME[self.phase]} base=({a.base_xy[0]:.2f},{a.base_xy[1]:.2f}) "
             f"yaw={a.base_yaw:.2f} cmd=({a.des_lin:.2f},{a.des_ang:.2f}) "
+            f"meas_v=({a.base_lin_meas:.3f},{a.base_ang_meas:.3f}) "
+            f"tick={getattr(self, '_tick_dt', 0.0):.2f} "
             f"front_clear={self._front_clear()} nav={self.nav_idx}/{len(self.route)}:{self.nav_mode} "
             f"lock={self.target_tracker.sample_count} pending={pending} inv={inv}")
 
