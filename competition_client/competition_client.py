@@ -115,15 +115,19 @@ PLACE_DROP_Z = TABLE_TOP_Z + ITEM_HALF_H + 0.005    # ~0.845: set down (small dr
 PLACE_RAISE_Z = 1.00                       # lift clear before homing
 
 # scan behaviour
-SCAN_DWELL = 0.8          # base dwell per view
-SCAN_DWELL_MAX = 2.0      # extend while new detections keep arriving
-SCAN_SETTLE = 0.8
+SCAN_DWELL = 0.5          # base dwell per view
+SCAN_DWELL_MAX = 1.2      # extend while new detections keep arriving
+SCAN_SETTLE = 0.4
 
 # hard-coded exploration primitives (departure + shelf zone)
-EXPLORE_SPEED = 0.10          # straight-line cruise (start -> shelf lane)
+EXPLORE_SPEED = 0.10          # straight-line cruise (departure / RETURN primitives)
 EXPLORE_DRIVE_TOL = 0.06
 EXPLORE_TURN_TOL = 0.03
-EXPLORE_TURN_MAX = 0.15       # turn rate cap (a19bba0 value; avoids swaying)
+EXPLORE_TURN_MAX = 0.15       # turn rate cap (a19bba0 value; avoids RETURN swaying)
+# The shelf-scan plan may move/turn faster than the RETURN/ALIGN primitives
+# (it is a straight lane run with no held item), so scope the speed-up to SCAN.
+SCAN_SPEED = 0.15
+SCAN_TURN_MAX = 0.25
 # Final in-place alignment before grasping can spin a bit faster than the
 # travel turns (no translation, so the RETURN swaying is not a concern).
 ALIGN_TURN_MAX = 0.22
@@ -1251,7 +1255,7 @@ class CompetitionClient(Node):
         self.view_settle_t0 = 0.0
         self.view_products_seq = -1
 
-    def _drive_to(self, x, y):
+    def _drive_to(self, x, y, speed=EXPLORE_SPEED, turn_max=EXPLORE_TURN_MAX):
         """Drive to a world point; turn in place first when badly misaligned.
 
         This is a hard-coded primitive for the departure / shelf zone: it never
@@ -1265,8 +1269,8 @@ class CompetitionClient(Node):
             a.stop_base()
             return True
         err = wrap_to_pi(math.atan2(dy, dx) - a.base_yaw)
-        v = 0.0 if abs(err) > 0.4 else min(EXPLORE_SPEED, max(0.03, 0.6 * dist))
-        a.set_base_velocity(v, max(-EXPLORE_TURN_MAX, min(EXPLORE_TURN_MAX, 1.0 * err)))
+        v = 0.0 if abs(err) > 0.4 else min(speed, max(0.03, 0.6 * dist))
+        a.set_base_velocity(v, max(-turn_max, min(turn_max, 1.0 * err)))
         return False
 
     def _turn_to(self, yaw, max_rate=EXPLORE_TURN_MAX, gain=0.5):
@@ -1370,9 +1374,9 @@ class CompetitionClient(Node):
         kind = step[0]
         arg = step[1] if len(step) > 1 else None
         if kind == "goto":
-            done = self._drive_to(arg[0], arg[1])
+            done = self._drive_to(arg[0], arg[1], SCAN_SPEED, SCAN_TURN_MAX)
         elif kind == "turn":
-            done = self._turn_to(arg)
+            done = self._turn_to(arg, SCAN_TURN_MAX)
         elif kind == "drive":
             done = self._drive_dist(arg)
         else:
