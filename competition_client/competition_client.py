@@ -194,6 +194,7 @@ class CompetitionClient(Node):
         self.align_stage = "pos"
         self.align_settle_t0 = 0.0
         self.place_sub = 0
+        self.place_sub_t0 = 0.0
         self.recover_scans = 0
         self.deploy_pitch_idx = 0
         self.deploy_pitch_t = 0.0
@@ -373,6 +374,7 @@ class CompetitionClient(Node):
         self.stuck_t0 = self._now()
         if phase == PLACE:
             self.place_sub = 0
+            self.place_sub_t0 = self._now()
         elif phase == DEPLOY:
             self.deploy_pitch_idx = 0
             self.deploy_pitch_t = self._now()
@@ -1155,28 +1157,44 @@ class CompetitionClient(Node):
                 hover = np.array([place_xy[0], place_xy[1], PLACE_HOVER_Z])
                 if a.arm_to("right", hover, GRASP_ROT):
                     self.place_sub = 2
+                    self.place_sub_t0 = self._now()
                 else:
                     self.get_logger().warn(
                         "place hover IK failed; releasing in place")
                     self.place_sub = 3
+                    self.place_sub_t0 = self._now()
             elif self.place_sub == 2:
-                # 3) wait for the hover pose, then lower onto the table
-                if a.arm_settled("right", pos_tol=0.08, vel_tol=0.08):
+                # 3) wait for the hover pose, then lower onto the table.  A
+                # wrist joint may hold a residual (L3 reaches a limit), so
+                # accept the EE reaching the target, with a time fallback.
+                hover = np.array([place_xy[0], place_xy[1], PLACE_HOVER_Z])
+                at_hover = float(np.linalg.norm(
+                    a.ee_world("right") - hover)) < 0.05
+                if (at_hover or a.arm_settled("right", pos_tol=0.15, vel_tol=0.08)
+                        or self._now() - self.place_sub_t0 > 2.0):
                     drop = np.array([place_xy[0], place_xy[1], PLACE_DROP_Z])
                     if a.arm_to("right", drop, GRASP_ROT):
                         self.place_sub = 3
+                        self.place_sub_t0 = self._now()
             elif self.place_sub == 3:
-                # 4) once settled just above the surface, open the gripper
-                if a.arm_settled("right", pos_tol=0.05, vel_tol=0.05):
+                # 4) once at the set-down pose, open the gripper (EE-based, with
+                # a time fallback so the item is always released)
+                drop = np.array([place_xy[0], place_xy[1], PLACE_DROP_Z])
+                at_drop = float(np.linalg.norm(
+                    a.ee_world("right") - drop)) < 0.05
+                if (at_drop or a.arm_settled("right", pos_tol=0.15, vel_tol=0.08)
+                        or self._now() - self.place_sub_t0 > 1.5):
                     a.set_gripper("right", GRIP_OPEN)
                     self.place_sub = 4
                     self.state_t0 = self._now()
+                    self.place_sub_t0 = self._now()
             elif self.place_sub == 4:
                 # 5) let the item settle, then lift clear of the table
                 if self._now() - self.state_t0 > 0.8:
                     raise_pose = np.array([place_xy[0], place_xy[1], PLACE_RAISE_Z])
                     if a.arm_to("right", raise_pose, GRASP_ROT):
                         self.place_sub = 5
+                        self.place_sub_t0 = self._now()
                     else:
                         a.home()
                         self._enter(NEXT)
@@ -1187,9 +1205,12 @@ class CompetitionClient(Node):
                     self._enter(NEXT)
             if self._now() - self.last_arm_dbg > 0.5:
                 self.last_arm_dbg = self._now()
+                ee = a.ee_world("right")
+                drop = np.array([place_xy[0], place_xy[1], PLACE_DROP_Z])
                 self.get_logger().info(
                     f"[place] sub={self.place_sub} slide={a.slide_meas:.3f} "
-                    f"ee={np.round(a.ee_world('right'), 3)} "
+                    f"ee={np.round(ee, 3)} d_drop="
+                    f"{float(np.linalg.norm(ee - drop)):.3f} "
                     f"grip={a.gripper_meas('right'):.3f}")
         elif self.phase == NEXT:
             if self.target is not None:
