@@ -31,6 +31,28 @@ class ScanProjectionTests(unittest.TestCase):
         hit = planner.world_to_idx(0.5, 0.0)
         self.assertFalse(planner.dynamic[hit])
 
+    def test_drops_self_echo_behind_lidar_face(self):
+        planner = GridPlanner()
+        planner.update_scan(
+            np.array([0.2]), math.pi, 1.0, 0.0, 0.0, 0.0,
+            sensor_pose=(0.1137, 0.0, 0.0),
+            range_min=0.02, range_max=12.0,
+        )
+
+        behind = planner.world_to_idx(0.1137 - 0.2, 0.0)
+        self.assertFalse(planner.dynamic[behind])
+
+    def test_keeps_close_obstacle_in_front_of_lidar_face(self):
+        planner = GridPlanner()
+        planner.update_scan(
+            np.array([0.12]), 0.0, 1.0, 0.0, 0.0, 0.0,
+            sensor_pose=(0.1137, 0.0, 0.0),
+            range_min=0.02, range_max=12.0,
+        )
+
+        front = planner.world_to_idx(0.1137 + 0.12, 0.0)
+        self.assertTrue(planner.dynamic[front])
+
 
 if __name__ == "__main__":
     unittest.main()

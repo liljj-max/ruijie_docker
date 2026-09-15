@@ -50,10 +50,15 @@ LASER_OFFSET = (0.1137, 0.0, 0.0)
 # Footprint half extents used to drop self returns (range_filter footprint mode).
 FOOT_HALF_X = 0.35
 FOOT_HALF_Y = 0.35
+# A return is only treated as a self echo when it is inside the footprint box
+# AND at/behind the lidar face (plus this small pad).  The lidar sits 0.1137 m
+# ahead of base_link, so a real obstacle that reaches the front of the box
+# (e.g. box_05 at ~0.23 m) must NOT be discarded.
+SELF_ECHO_PAD = 0.04
 
 MIN_RANGE = 0.05
 MAX_RANGE = 12.0
-PERSIST = 3            # frames an obstacle survives without re-observation
+PERSIST = 8            # frames an obstacle survives without re-observation
 PREFER_CLEAR = 0.60    # prefer this much margin beyond the inflation radii
 COST_K = 8.0           # weight of the proximity cost (higher = keep to the middle)
 # A* must not plan through gaps the local planner refuses to follow: keep the
@@ -161,7 +166,8 @@ class GridPlanner:
         ex_b = sx + r * np.cos(bang)
         ey_b = sy + r * np.sin(bang)
         inside = (np.abs(ex_b) <= FOOT_HALF_X) & (np.abs(ey_b) <= FOOT_HALF_Y)
-        valid &= ~inside
+        behind_lidar_face = ex_b <= sx + SELF_ECHO_PAD
+        valid &= ~(inside & behind_lidar_face)
         if not np.any(valid):
             self.dynamic = self.hits > 0
             self._recompute()
